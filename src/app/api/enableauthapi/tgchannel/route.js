@@ -72,7 +72,7 @@ export async function POST(request) {
 			"name": fileData.file_name
 		}
 
-		// ===== 新增：给频道里的图片挂上「点一下就复制」的格式按钮 =====
+		// ===== 新增：给频道里的图片挂上「点一下就复制」的四种格式按钮（2×2 两行布局） =====
 		await sendLinkButtons(env, responseData, data.url);
 
 		if (!env.IMG) {
@@ -137,20 +137,27 @@ export async function POST(request) {
 }
 
 
-// ===== 给频道里的图片挂上三个「点击即复制」的格式按钮 =====
-// 效果：图片下方出现 [图片直链] [HTML] [Markdown] 三个按钮，
+// ===== 给频道里的图片挂上四个「点击即复制」的格式按钮（2×2 两行两列） =====
+// 效果：图片下方出现一个两行两列的按钮区：
+//         图片直链   |   HTML
+//         Markdown   |   BBCode
 //       点哪个就把对应格式的代码复制到剪贴板（Telegram 会弹「已复制」提示）。
 //
 // 实现方式：上传成功后调用 editMessageReplyMarkup，给那条图片消息追加一个内联键盘(inline_keyboard)。
-//           按钮类型用 copy_text（Telegram Bot API 的"复制文本"按钮），每种格式一个按钮。
+//           按钮类型用 copy_text（Telegram Bot API 的"复制文本"按钮）。
+//           布局的关键：inline_keyboard 是一个"行数组的数组"——
+//           同一子数组里放 2 个按钮 → 这一行显示 2 个（并排）；
+//           一共放 2 个子数组 → 共 2 行。合计就是 2×2 的网格。
+//           （想改成 1 列或 4 列，只需要调整每个子数组里放几个按钮。）
 //
-// 三种格式：
+// 四种格式：
 //   图片直链  https://你的域名/api/cfile/xxxxx
 //   HTML      <img src="https://你的域名/api/cfile/xxxxx">
 //   Markdown  ![图片](https://你的域名/api/cfile/xxxxx)
+//   BBCode    [img]https://你的域名/api/cfile/xxxxx[/img]
 //
 // 兜底：万一挂按钮失败（例如该消息类型不支持内联键盘），
-//       就把三种格式全部写进图片的「说明文字(caption)」，保证内容不丢。
+//       就把四种格式全部写进图片的「说明文字(caption)」，保证内容不丢。
 //       整个函数包在 try/catch 内，任何失败都不会影响网页端的上传结果。
 async function sendLinkButtons(env, responseData, url) {
 	try {
@@ -159,18 +166,22 @@ async function sendLinkButtons(env, responseData, url) {
 
 		const ua = " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0";
 
-		// 三种格式的具体内容
+		// 四种格式的具体内容
 		const linkDirect = url;
 		const linkHtml = '<img src="' + url + '">';
 		const linkMarkdown = '![图片](' + url + ')';
+		const linkBBCode = '[img]' + url + '[/img]';
 
-		// 方案 A：给图片挂三个「点击即复制」按钮
+		// 方案 A：给图片挂四个「点击即复制」按钮，排成两行两列
 		const replyMarkup = {
 			inline_keyboard: [
 				[
 					{ text: '图片直链', copy_text: { text: linkDirect } },
-					{ text: 'HTML', copy_text: { text: linkHtml } },
-					{ text: 'Markdown', copy_text: { text: linkMarkdown } }
+					{ text: 'HTML', copy_text: { text: linkHtml } }
+				],
+				[
+					{ text: 'Markdown', copy_text: { text: linkMarkdown } },
+					{ text: 'BBCode', copy_text: { text: linkBBCode } }
 				]
 			]
 		};
@@ -190,10 +201,17 @@ async function sendLinkButtons(env, responseData, url) {
 		const btnData = await btnRes.json();
 		if (btnData && btnData.ok) return;
 
-		// 方案 B（兜底）：挂按钮失败，就把三种格式写进说明文字
-		const fallbackCaption = '图片直链：\n' + linkDirect +
+		// 方案 B（兜底）：挂按钮失败，就把四种格式写进说明文字
+		let fallbackCaption = '图片直链：\n' + linkDirect +
 			'\n\nHTML：\n' + linkHtml +
-			'\n\nMarkdown：\n' + linkMarkdown;
+			'\n\nMarkdown：\n' + linkMarkdown +
+			'\n\nBBCode：\n' + linkBBCode;
+
+		// Telegram 的说明文字上限是 1024 字符；正常图片远低于此，
+		// 仅对极端长的 file_id 做一次截断保护，避免请求被直接拒绝。
+		if (fallbackCaption.length > 1024) {
+			fallbackCaption = fallbackCaption.slice(0, 1023) + '…';
+		}
 
 		await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
 			method: 'POST',
