@@ -10,9 +10,24 @@ const corsHeaders = {
 	'Content-Type': 'application/json'
 };
 
+const UA = " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0";
+
+// Telegram 的硬性上限，超了必定被拒。
+// 页面上那句"最大 5MB"只是文案，代码里从来没有强制过 —— 这里把服务端校验补上，
+// 并且给出人话提示，而不是让 Telegram 的报错被吞掉（见下面的关键修复）。
+const MAX_PHOTO_BYTES = 10 * 1024 * 1024;  // sendPhoto：10MB
+const MAX_OTHER_BYTES = 50 * 1024 * 1024;  // sendVideo / sendAudio / sendDocument：50MB
+
+function humanSize(bytes) {
+	if (typeof bytes !== 'number' || !isFinite(bytes) || bytes <= 0) return '未知大小';
+	if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+	if (bytes >= 1024) return (bytes / 1024).toFixed(0) + ' KB';
+	return bytes + ' B';
+}
+
 export async function POST(request) {
 	const { env, cf, ctx } = getRequestContext();
-	
+
 	if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) {
 		return Response.json({
 			status: 500,
@@ -24,12 +39,25 @@ export async function POST(request) {
 		})
 	}
 
-	const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || request.socket.remoteAddress;
+	const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip');
 	const clientIp = ip ? ip.split(',')[0].trim() : 'IP not found';
 	const Referer = request.headers.get('Referer') || "Referer";
 
 	const formData = await request.formData();
-	const fileType = formData.get('file').type;
+	const uploadFile = formData.get('file');
+
+	if (!uploadFile || typeof uploadFile === 'string') {
+		return Response.json({
+			status: 400,
+			message: '没有收到要上传的文件',
+			success: false
+		}, {
+			status: 400,
+			headers: corsHeaders,
+		})
+	}
+
+	const fileType = uploadFile.type || 'application/octet-stream';
 
 	const req_url = new URL(request.url);
 
@@ -42,29 +70,73 @@ export async function POST(request) {
 
 	let defaultType = { url: 'sendDocument', type: 'document' };
 
-	const { url: endpoint, type: fileTypevalue } = Object.keys(fileTypeMap)
-		.find(key => fileType.startsWith(key))
-		? fileTypeMap[Object.keys(fileTypeMap).find(key => fileType.startsWith(key))]
-		: defaultType;
+	const matchedKey = Object.keys(fileTypeMap).find(key => fileType.startsWith(key));
+	const { url: endpoint, type: fileTypevalue } = matchedKey ? fileTypeMap[matchedKey] : defaultType;
 
+	// ===== 服务端大小校验 =====
+	// 原来是"前端写着 5MB、其实谁都没拦"，用户选个大图能一路提交到 Telegram，
+	// 然后收到一个看不懂的 500。现在提前拦下并说清楚原因。
+	const isPhoto = endpoint === 'sendPhoto';
+	const sizeLimit = isPhoto ? MAX_PHOTO_BYTES : MAX_OTHER_BYTES;
+	if (typeof uploadFile.size === 'number' && uploadFile.size > sizeLimit) {
+		return Response.json({
+			status: 400,
+			message: `${isPhoto ? '图片' : '文件'}大小 ${humanSize(uploadFile.size)}，超过 Telegram 的 ${isPhoto ? '10MB（图片）' : '50MB'} 上限，请压缩后再传`,
+			success: false
+		}, {
+			status: 400,
+			headers: corsHeaders,
+		})
+	}
 
 	const up_url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${endpoint}`;
 	let newformData = new FormData();
 	newformData.append("chat_id", env.TG_CHAT_ID);
-	newformData.append(fileTypevalue, formData.get('file'));
+	newformData.append(fileTypevalue, uploadFile);
 
 	try {
 		const res_img = await fetch(up_url, {
 			method: "POST",
 			headers: {
-				"User-Agent": " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
+				"User-Agent": UA
 			},
 			body: newformData,
 		});
 
 
 		let responseData = await res_img.json();
+
+		// ===== ★ 关键修复：Telegram 说"不行"的时候要先停下来 =====
+		// 文件超限、bot 不是频道管理员、频道不可达……这些情况下 Telegram 会回
+		// {ok:false, description:"..."}，而原代码不管三七二十一继续去取
+		// responseData.result.file_id —— getFile() 在失败时返回 null，
+		// 于是变成 "Cannot read properties of null (reading 'file_id')"。
+		// 结果就是：Telegram 明明告诉了你原因，却被这一个类型错误盖住了。
+		if (!responseData || responseData.ok !== true || !responseData.result) {
+			const reason = (responseData && responseData.description) || `Telegram 返回 HTTP ${res_img.status}`;
+			console.error('Telegram 拒绝了这次上传：', reason);
+			return Response.json({
+				status: 502,
+				message: `Telegram 拒绝了这次上传：${reason}`,
+				success: false
+			}, {
+				status: 502,
+				headers: corsHeaders,
+			})
+		}
+
 		const fileData = await getFile(responseData);
+
+		if (!fileData || !fileData.file_id) {
+			return Response.json({
+				status: 502,
+				message: '上传已发出，但没能从 Telegram 的回复里解析出文件信息（这个文件类型可能暂不支持）',
+				success: false
+			}, {
+				status: 502,
+				headers: corsHeaders,
+			})
+		}
 
 		const data = {
 			"url": `${req_url.origin}/api/cfile/${fileData.file_id}`,
@@ -72,7 +144,7 @@ export async function POST(request) {
 			"name": fileData.file_name
 		}
 
-		// ===== 新增：给频道里的图片挂上「点一下就复制」的四种格式按钮（2×2 两行布局） =====
+		// ===== 给频道里的图片挂上「点一下就复制」的四种格式按钮（2×2 两行布局） =====
 		await sendLinkButtons(env, responseData, data.url);
 
 		if (!env.IMG) {
@@ -84,49 +156,43 @@ export async function POST(request) {
 				status: 200,
 				headers: corsHeaders,
 			})
-		} else {
-			try {
-				const rating_index = await getRating(env, `${fileData.file_id}`);
-				const nowTime = await get_nowTime()
-				await insertImageData(env.IMG, `/cfile/${fileData.file_id}`, Referer, clientIp, rating_index, nowTime);
-
-				return Response.json({
-					...data,
-					msg: "2",
-					Referer: Referer,
-					clientIp: clientIp,
-					rating_index: rating_index,
-					nowTime: nowTime
-				}, {
-					status: 200,
-					headers: corsHeaders,
-				})
-
-
-
-
-			} catch (error) {
-				console.log(error);
-				await insertImageData(env.IMG, `/cfile/${fileData.file_id}`, Referer, clientIp, -1, nowTime);
-
-
-				return Response.json({
-					"msg": error.message
-				}, {
-					status: 500,
-					headers: corsHeaders,
-				})
-			}
 		}
 
+		// nowTime 提到内层 try 之外先算好。
+		// 原代码把它声明在内层 try 里、却在 catch 里引用，一旦异常发生在赋值之前，
+		// 那个 catch 会再抛一个 "Cannot access 'nowTime' before initialization"，
+		// 把原始错误盖掉。
+		const nowTime = await get_nowTime();
 
+		// 写库失败不该让"其实已经成功的上传"变成失败（图片已经进频道了），
+		// 但也不能像原代码那样 catch 里什么都不做 —— 至少要在日志里留下痕迹。
+		let rating_index = null;
+		let dbError = null;
+		try {
+			rating_index = await getRating(env, `${fileData.file_id}`);
+			await insertImageData(env.IMG, `/cfile/${fileData.file_id}`, Referer, clientIp, rating_index, nowTime);
+		} catch (error) {
+			dbError = error && error.message ? error.message : String(error);
+			console.error('写入 D1 失败（图片已上传成功，仅记录失败）：', dbError);
+		}
 
-
+		return Response.json({
+			...data,
+			msg: "2",
+			Referer: Referer,
+			clientIp: clientIp,
+			rating_index: rating_index,
+			nowTime: nowTime,
+			...(dbError ? { db_error: dbError } : {})
+		}, {
+			status: 200,
+			headers: corsHeaders,
+		})
 
 	} catch (error) {
 		return Response.json({
 			status: 500,
-			message: ` ${error.message}`,
+			message: ` ${error && error.message ? error.message : '未知错误'}`,
 			success: false
 		}, {
 			status: 500,
@@ -164,7 +230,7 @@ async function sendLinkButtons(env, responseData, url) {
 		const messageId = responseData && responseData.result ? responseData.result.message_id : null;
 		if (!messageId) return;
 
-		const ua = " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0";
+		const ua = UA;
 
 		// 四种格式的具体内容
 		const linkDirect = url;
@@ -233,11 +299,11 @@ async function sendLinkButtons(env, responseData, url) {
 
 async function getFile_path(env, file_id) {
 	try {
-		const url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/getFile?file_id=${file_id}`;
+		const url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(file_id)}`;
 		const res = await fetch(url, {
 			method: 'GET',
 			headers: {
-				"User-Agent": " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome"
+				"User-Agent": UA
 			},
 		})
 
@@ -277,6 +343,12 @@ const getFile = async (response) => {
 			return getFileDetails(response.result.video);
 		}
 
+		// 补上 audio —— sendAudio 走的通道原来没有对应分支，
+		// 上传音频会走到最后的 return null，然后被当成"解析失败"。
+		if (response.result.audio) {
+			return getFileDetails(response.result.audio);
+		}
+
 		if (response.result.document) {
 			return getFileDetails(response.result.document);
 		}
@@ -290,15 +362,16 @@ const getFile = async (response) => {
 
 
 
-async function insertImageData(env, src, referer, ip, rating, time) {
-	try {
-		const instdata = await env.prepare(
-			`INSERT INTO imginfo (url, referer, ip, rating, total, time)
-           VALUES ('${src}', '${referer}', '${ip}', ${rating}, 1, '${time}')`
-		).run()
-	} catch (error) {
-
-	};
+async function insertImageData(DB, src, referer, ip, rating, time) {
+	// ★ 参数化写入。
+	// 原来是把 ${referer} / ${ip} 直接拼进 SQL 字符串 —— 而这两个值来自请求头
+	// （Referer、x-forwarded-for），任何访问者都能随手改。绑上 D1 之后，
+	// 这就是一条真实可被利用的注入通道。
+	// 同时去掉了原来那个空 catch：写库失败不再被静默吞掉。
+	await DB.prepare(
+		`INSERT INTO imginfo (url, referer, ip, rating, total, time)
+		 VALUES (?, ?, ?, ?, 1, ?)`
+	).bind(src, referer, ip, rating, time).run();
 }
 
 
@@ -334,6 +407,10 @@ async function getRating(env, url) {
 		const ratingApi = env.RATINGAPI ? `${env.RATINGAPI}?` : ModerateContentUrl;
 
 		if (ratingApi) {
+			// ⚠️ 注意这里：请求的 URL 里带着 Telegram 的文件地址，而文件地址里
+			//    含有你的 TG_BOT_TOKEN。也就是说，一旦开启鉴黄，你的 bot token
+			//    就交给了这个鉴黄服务方（拿到 token 就能完全控制你的 bot）。
+			//    要开请务必让 RATINGAPI 指向你自己部署的服务，不要用公共第三方 API。
 			const res = await fetch(`${ratingApi}url=https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${file_path}`);
 			const data = await res.json();
 			const rating_index = data.hasOwnProperty('rating_index') ? data.rating_index : -1;
