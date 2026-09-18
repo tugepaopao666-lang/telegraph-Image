@@ -88,6 +88,69 @@ export async function setState(db, key, value) {
 // Telegram 调用
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 发出前的文本兜底：把"被转义的表情"还原回真字符
+// ---------------------------------------------------------------------------
+//
+// 背景（2026-09-18，业主实测反馈）：
+//   源码里这一行是**真实的表情字符**（一个相机图标）：
+//       '<emoji> <b>图床管理助手</b>'
+//   但业主在 Telegram 里收到的却是一串「反斜杠 + u + 4 位十六进制」形式的字面文本。
+//   也就是说：从"源码"到"最终发出去的字符串"之间，有某一环把表情转义成了
+//   反斜杠形式（最可能是粘贴进 GitHub 的过程中被某个工具转义了）。
+//
+// 处理方式：不去猜是哪一环转的，也不指望以后不再发生，
+//   直接在**发出前**做一次还原 —— 文本里凡是出现 \uXXXX / \UXXXXXXXX
+//   （不管前面有几个反斜杠），就还原成真字符。
+//   没有转义时它什么都不做，所以对正常消息零影响。
+//
+// ⚠️ 这里**故意不在源码里写反斜杠字面量**，而是用 String.fromCharCode(92) 拼出来 ——
+//    因为"反斜杠被再转义一次"正是我们要防的那个毛病：如果这里写死一个反斜杠，
+//    它自己也会被一起转义，兜底就失效了。这不是炫技，是被现实逼的。
+const BACKSLASH = String.fromCharCode(92);                       // 就是 \ 这个字符
+// ⚠️ 正则里要匹配"字面反斜杠"，得写成 \\+（两个反斜杠 + 加号）；
+//    只写 \+ 在正则里是"一个字面加号"，不匹配反斜杠 —— 所以这里要 BACKSLASH 两次。
+const RE_U4 = new RegExp(BACKSLASH + BACKSLASH + '+u([0-9a-fA-F]{4})', 'g'); // 四位十六进制那种
+const RE_U8 = new RegExp(BACKSLASH + BACKSLASH + '+U([0-9a-fA-F]{8})', 'g'); // \U0001F4F7 这种
+
+/**
+ * 把文本里"被写成了转义形式"的字符还原成真字符。
+ * 例：把写成「反斜杠+u+4位十六进制」形式的两段，还原成 1 个表情字符。
+ */
+export function unescapeEmoji(s) {
+  if (s == null) return s;
+  const str = String(s);
+  if (str.indexOf(BACKSLASH) === -1) return str;   // 快路径：绝大多数消息直接原样返回
+  return str
+    .replace(RE_U8, (whole, hex) => {
+      const cp = parseInt(hex, 16);
+      return (cp > 0x10ffff) ? whole : String.fromCodePoint(cp);
+    })
+    .replace(RE_U4, (whole, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+/**
+ * 把要发给 Telegram 的 payload 里所有"给用户看的文本"过一遍上面的还原。
+ * 覆盖：text、caption，以及行内键盘的按钮文字。
+ */
+function fixOutgoing(payload) {
+  const out = Object.assign({}, payload || {});
+  if (typeof out.text === 'string') out.text = unescapeEmoji(out.text);
+  if (typeof out.caption === 'string') out.caption = unescapeEmoji(out.caption);
+  if (out.reply_markup && Array.isArray(out.reply_markup.inline_keyboard)) {
+    out.reply_markup = Object.assign({}, out.reply_markup, {
+      inline_keyboard: out.reply_markup.inline_keyboard.map((row) =>
+        (Array.isArray(row) ? row : []).map((btn) => {
+          const b = Object.assign({}, btn);
+          if (typeof b.text === 'string') b.text = unescapeEmoji(b.text);
+          return b;
+        })
+      )
+    });
+  }
+  return out;
+}
+
 export function createTg({ token, fetchImpl = fetch }) {
   const base = `https://api.telegram.org/bot${token}`;
 
@@ -101,12 +164,12 @@ export function createTg({ token, fetchImpl = fetch }) {
 
   return {
     token,
-    /** 普通 JSON 调用 */
+    /** 普通 JSON 调用（发出前会把被转义的表情还原，见 unescapeEmoji） */
     async call(method, payload) {
       const res = await fetchImpl(`${base}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
-        body: JSON.stringify(payload || {})
+        body: JSON.stringify(fixOutgoing(payload))
       });
       return parse(res);
     },
