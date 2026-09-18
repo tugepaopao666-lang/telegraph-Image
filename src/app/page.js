@@ -21,7 +21,82 @@ const LoginButton = ({ onClick, href, children }) => (
   </button>
 );
 
+// ===== 新增：上传前在浏览器里先压一遍图片 =====
+// 【这一整段是新增的，请粘到 src/app/page.js 里 `export default function Home() {` 的上一行】
 
+// 为什么放在前端压：Cloudflare 的 Edge 运行时没有图像处理库，服务端压不了；
+// 而"传不上去"最常见的原因，就是手机随手拍的照片超过了 Telegram 的 10MB 上限。
+// 在浏览器里先压一遍，既省上传流量，也让大图能顺利传上去。
+//
+// 设计原则（很重要）：**只在明显超大时才动手，任何一步出错都原样退回原图**。
+// 所以它不可能把一张原本能传的图弄成传不了。
+
+const COMPRESS_TRIGGER_BYTES = 10 * 1024 * 1024;  // 超过 10MB 才考虑压
+const COMPRESS_TARGET_BYTES = 8 * 1024 * 1024; // 目标：压到 1.2MB 以内
+const COMPRESS_MAX_EDGE = 2560;                  // 最长边不超过 2560 像素
+
+async function compressImageIfNeeded(file) {
+  try {
+    if (!file || typeof file !== 'object') return file;
+
+    const type = file.type || '';
+    // 只处理位图。GIF 一动就掉帧，SVG 是矢量的、转了反而变糊 —— 都不碰。
+    if (!type.startsWith('image/')) return file;
+    if (type === 'image/gif' || type === 'image/svg+xml') return file;
+    if (file.size <= COMPRESS_TRIGGER_BYTES) return file;
+    if (typeof createImageBitmap !== 'function') return file;
+
+    const bitmap = await createImageBitmap(file);
+    const w0 = bitmap.width;
+    const h0 = bitmap.height;
+    if (!w0 || !h0) return file;
+
+    const scale = Math.min(1, COMPRESS_MAX_EDGE / Math.max(w0, h0));
+    const w = Math.max(1, Math.round(w0 * scale));
+    const h = Math.max(1, Math.round(h0 * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return file;
+
+    // 先铺白底：PNG 的透明区域转成 JPEG 后默认会变黑，铺白更符合直觉
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    if (typeof bitmap.close === 'function') {
+      try { bitmap.close(); } catch (e) { /* 忽略 */ }
+    }
+
+    const toBlob = (quality) => new Promise((resolve) => {
+      try {
+        canvas.toBlob((b) => resolve(b), 'image/jpeg', quality);
+      } catch (e) {
+        resolve(null);
+      }
+    });
+
+    let quality = 0.82;
+    let blob = await toBlob(quality);
+    // 逐步降质量，直到进入目标大小（最多降 4 档，避免压得太糊）
+    let guard = 0;
+    while (blob && blob.size > COMPRESS_TARGET_BYTES && quality > 0.5 && guard < 4) {
+      quality -= 0.1;
+      guard++;
+      blob = await toBlob(quality);
+    }
+
+    // 压完反而更大（小图、纯色图很常见）→ 老实退回原图
+    if (!blob || blob.size >= file.size) return file;
+
+    const newName = (file.name || 'image').replace(/\.[^.]+$/, '') + '.jpg';
+    return new File([blob], newName, { type: 'image/jpeg', lastModified: Date.now() });
+  } catch (e) {
+    // 任何意外都退回原图 —— 压缩只是加分项，不该成为上传失败的原因
+    return file;
+  }
+}
 export default function Home() {
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [uploadedImages, setUploadedImages] = useState([]);
@@ -168,7 +243,7 @@ export default function Home() {
       for (const file of filesToUpload) {
         const formData = new FormData();
 
-        formData.append(formFieldName, file);
+        formData.append(formFieldName, await compressImageIfNeeded(file));
 
         try {
           const targetUrl = selectedOption === "tgchannel" || selectedOption === "r2"
@@ -495,7 +570,7 @@ export default function Home() {
             <div className="text-gray-800 text-lg">图片或视频上传
             </div>
             <div className="mb-4 text-sm text-gray-500">
-              上传文件最大 5 MB;本站已托管 <span className="text-cyan-600">{Total}</span> 张图片; 你访问本站的IP是：<span className="text-cyan-600">{IP}</span>
+              上传文件最大 10 MB;本站已托管 <span className="text-cyan-600">{Total}</span> 张图片; 你访问本站的IP是：<span className="text-cyan-600">{IP}</span>
             </div>
           </div>
           <div className="flex  flex-col sm:flex-col   md:w-auto lg:flex-row xl:flex-row  2xl:flex-row  mx-auto items-center  ">
