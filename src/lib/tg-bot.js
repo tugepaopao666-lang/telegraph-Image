@@ -137,8 +137,15 @@ async function reply(tg, chatId, text, extra) {
 }
 
 // ---------------------------------------------------------------------------
-// 命令菜单
+// 命令（⚠️ 不再注册成 Telegram 菜单）
 // ---------------------------------------------------------------------------
+//
+// ⚠️ 这份列表**不再往 Telegram 注册菜单**（2026-09-18 起，业主主动要求）。
+//    理由：他的群里有别的机器人，一输入 / 就弹出一长串命令，太乱。
+//    现在它的用途是两个：
+//      ① 作为「这个 bot 有哪些命令」的唯一权威清单（给文档与测试用）；
+//      ② setupBot() 用它报出「还有几条命令可用」。
+//    命令本身**一个都没删**，只是不再出现在 / 菜单里 —— 需要时私聊手打即可。
 
 export const BOT_COMMANDS = [
   { command: 'start', description: '使用说明' },
@@ -745,11 +752,19 @@ export async function setupBot({ env, tg, origin, db }) {
   });
   if (setWh && setWh.ok) await setState(db, 'webhook_url', webhookUrl);
 
-  const mc = await tg.call('setMyCommands', { commands: BOT_COMMANDS });
+  // 清空命令菜单（2026-09-18 业主主动要求，理由见本文件顶部 BOT_COMMANDS 的注释）。
+  // 原因：他的群里有别的机器人，一输入 / 就弹出一长串命令，太乱。
+  // ⚠️ 命令本身**一个都没删** —— /start /help /stats /del /export /sync /health /id
+  //    全部照旧可用，只是在 Telegram 里**不再注册成菜单**，需要时直接在私聊手打。
+  // 用 deleteMyCommands 而不是"什么都不做"，是为了把**已经注册过的菜单也清掉**，
+  // 并且重复访问 /setup 也会保持"没有菜单"这个状态（幂等）。
+  const mc = await tg.call('deleteMyCommands', {});
   steps.push({
-    step: `注册命令菜单（${BOT_COMMANDS.length} 条）`,
+    step: '清空 Telegram 命令菜单',
     ok: !!(mc && mc.ok),
-    detail: (mc && mc.ok) ? '在私聊里输入 / 就能看到菜单' : ((mc && mc.description) || '失败')
+    detail: (mc && mc.ok)
+      ? `${BOT_COMMANDS.length} 条命令仍可手打使用（私聊发 /help 查看全部）`
+      : ((mc && mc.description) || '失败')
   });
 
   // --- 这里原本会「往频道发一条使用说明 + 置顶」。现已彻底删除（2026-09-18）---
