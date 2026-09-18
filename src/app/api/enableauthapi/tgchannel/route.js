@@ -1,5 +1,16 @@
 export const runtime = 'edge';
 import { getRequestContext } from '@cloudflare/next-on-pages';
+import {
+	UA,
+	MAX_PHOTO_BYTES,
+	MAX_OTHER_BYTES,
+	humanSize,
+	shortLink,
+	buildKeyboard,
+	buildCaption,
+	nowTimeString
+} from '@/lib/tg-common';
+import { ensureSchema, saveImageInfo } from '@/lib/tg-bot';
 
 
 
@@ -9,21 +20,6 @@ const corsHeaders = {
 	'Access-Control-Max-Age': '86400', // 24 hours
 	'Content-Type': 'application/json'
 };
-
-const UA = " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0";
-
-// Telegram 的硬性上限，超了必定被拒。
-// 页面上那句"最大 5MB"只是文案，代码里从来没有强制过 —— 这里把服务端校验补上，
-// 并且给出人话提示，而不是让 Telegram 的报错被吞掉（见下面的关键修复）。
-const MAX_PHOTO_BYTES = 10 * 1024 * 1024;  // sendPhoto：10MB
-const MAX_OTHER_BYTES = 50 * 1024 * 1024;  // sendVideo / sendAudio / sendDocument：50MB
-
-function humanSize(bytes) {
-	if (typeof bytes !== 'number' || !isFinite(bytes) || bytes <= 0) return '未知大小';
-	if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
-	if (bytes >= 1024) return (bytes / 1024).toFixed(0) + ' KB';
-	return bytes + ' B';
-}
 
 export async function POST(request) {
 	const { env, cf, ctx } = getRequestContext();
@@ -89,9 +85,16 @@ export async function POST(request) {
 		})
 	}
 
+	// ===== 多频道分流 =====
+	// 配了 TG_CHAT_ID_VIDEO 的话，视频和动图就存到另一个频道去，
+	// 避免大文件把主频道刷屏，也方便以后按类型做备份。
+	// 没配就一切照旧，行为完全不变。
+	const isVideoLike = endpoint === 'sendVideo' || fileType === 'image/gif';
+	const chatId = (isVideoLike && env.TG_CHAT_ID_VIDEO) ? env.TG_CHAT_ID_VIDEO : env.TG_CHAT_ID;
+
 	const up_url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${endpoint}`;
 	let newformData = new FormData();
-	newformData.append("chat_id", env.TG_CHAT_ID);
+	newformData.append("chat_id", chatId);
 	newformData.append(fileTypevalue, uploadFile);
 
 	try {
@@ -138,14 +141,22 @@ export async function POST(request) {
 			})
 		}
 
+		const origin = req_url.origin;
+
+		// ===== 短链（带扩展名）=====
+		// 原来返回的是 `${origin}/api/cfile/${file_id}`：又长、又没有扩展名，
+		// 公众号／知乎／不少 Markdown 编辑器会因为"URL 不以图片扩展名结尾"而拒收。
+		// 现在返回 `${origin}/i/${file_id}.jpg` 这种形式。
+		const url = shortLink(origin, fileData.file_id, fileType);
+
 		const data = {
-			"url": `${req_url.origin}/api/cfile/${fileData.file_id}`,
+			"url": url,
 			"code": 200,
 			"name": fileData.file_name
 		}
 
-		// ===== 给频道里的图片挂上「点一下就复制」的四种格式按钮（2×2 两行布局） =====
-		await sendLinkButtons(env, responseData, data.url);
+		// ===== 给频道里的图片挂上按钮（1 个打开 + 4 个复制，共 3 行）=====
+		await sendLinkButtons(env, responseData, url, chatId);
 
 		if (!env.IMG) {
 			data.env_img = "null"
@@ -158,19 +169,53 @@ export async function POST(request) {
 			})
 		}
 
-		// nowTime 提到内层 try 之外先算好。
-		// 原代码把它声明在内层 try 里、却在 catch 里引用，一旦异常发生在赋值之前，
-		// 那个 catch 会再抛一个 "Cannot access 'nowTime' before initialization"，
-		// 把原始错误盖掉。
-		const nowTime = await get_nowTime();
+		// nowTime 提到 try 之外先算好，避免 TDZ
+		const nowTime = nowTimeString();
 
 		// 写库失败不该让"其实已经成功的上传"变成失败（图片已经进频道了），
 		// 但也不能像原代码那样 catch 里什么都不做 —— 至少要在日志里留下痕迹。
 		let rating_index = null;
 		let dbError = null;
 		try {
+			await ensureSchema(env.IMG);
 			rating_index = await getRating(env, `${fileData.file_id}`);
-			await insertImageData(env.IMG, `/cfile/${fileData.file_id}`, Referer, clientIp, rating_index, nowTime);
+
+			// ★ 写入交给共享函数 saveImageInfo（见 src/lib/tg-bot.js）。
+			// 为什么不在这里自己写 INSERT：图片一进频道，Telegram 会立刻把这条
+			// channel_post 推给 webhook，webhook 那边会给同一个 url 补一条占位记录。
+			// 也就是说**这里是和 webhook 并发写同一行的**。
+			// 两边都无条件 INSERT 的话（而 imginfo.url 上没有唯一约束），
+			// 同一张图就会在后台列表里出现两行。
+			// saveImageInfo 用"先更新、没有再插入、最后还是被别人插了再更新一次"
+			// 的写法，保证任何交错顺序下都只剩一行、且内容是真实的那份。
+			const saved = await saveImageInfo({
+				db: env.IMG,
+				url: `/cfile/${fileData.file_id}`,
+				referer: Referer,
+				ip: clientIp,
+				rating: rating_index,
+				time: nowTime,
+				total: 1,
+				mode: 'authoritative'
+			});
+			if (saved && saved.reason === 'merged') {
+				console.log('saveImageInfo: 与 webhook 补录撞车，已合并为一行');
+			}
+
+			// 记下"这条图片对应频道里的哪条消息"。
+			// 以后 /del 命令和讨论组里回复「删除」都靠这张表定位。
+			const messageId = responseData.result && responseData.result.message_id;
+			if (messageId) {
+				await env.IMG.prepare(
+					'INSERT OR REPLACE INTO tgmsg (file_id, chat_id, message_id, kind, ts) VALUES (?, ?, ?, ?, ?)'
+				).bind(
+					fileData.file_id,
+					String(chatId),
+					messageId,
+					fileTypevalue,
+					new Date().toISOString()
+				).run();
+			}
 		} catch (error) {
 			dbError = error && error.message ? error.message : String(error);
 			console.error('写入 D1 失败（图片已上传成功，仅记录失败）：', dbError);
@@ -203,92 +248,53 @@ export async function POST(request) {
 }
 
 
-// ===== 给频道里的图片挂上四个「点击即复制」的格式按钮（2×2 两行两列） =====
-// 效果：图片下方出现一个两行两列的按钮区：
-//         图片直链   |   HTML
-//         Markdown   |   BBCode
-//       点哪个就把对应格式的代码复制到剪贴板（Telegram 会弹「已复制」提示）。
+// ===== 给频道里的图片挂上按钮 =====
+// 布局（3 行）：
+//   🔍 打开图片            ← url 按钮，点一下直接看图（对不熟悉的人最友好）
+//   图片直链 | HTML        ← copy_text 按钮，点一下复制到剪贴板
+//   Markdown | BBCode
 //
-// 实现方式：上传成功后调用 editMessageReplyMarkup，给那条图片消息追加一个内联键盘(inline_keyboard)。
-//           按钮类型用 copy_text（Telegram Bot API 的"复制文本"按钮）。
-//           布局的关键：inline_keyboard 是一个"行数组的数组"——
-//           同一子数组里放 2 个按钮 → 这一行显示 2 个（并排）；
-//           一共放 2 个子数组 → 共 2 行。合计就是 2×2 的网格。
-//           （想改成 1 列或 4 列，只需要调整每个子数组里放几个按钮。）
+// ⚠️ Telegram 的规则：一个按钮只能**二选一**（要么 url、要么 copy_text），
+//    所以「打开图片」是**新增一个按钮**，而不是把原来的复制按钮改造出来的。
 //
-// 四种格式：
-//   图片直链  https://你的域名/api/cfile/xxxxx
-//   HTML      <img src="https://你的域名/api/cfile/xxxxx">
-//   Markdown  ![图片](https://你的域名/api/cfile/xxxxx)
-//   BBCode    [img]https://你的域名/api/cfile/xxxxx[/img]
+// 布局规律：inline_keyboard 是"行数组的数组"——子数组个数 = 行数，
+//           每个子数组里放几个按钮 = 这一行有几列。
 //
 // 兜底：万一挂按钮失败（例如该消息类型不支持内联键盘），
 //       就把四种格式全部写进图片的「说明文字(caption)」，保证内容不丢。
 //       整个函数包在 try/catch 内，任何失败都不会影响网页端的上传结果。
-async function sendLinkButtons(env, responseData, url) {
+async function sendLinkButtons(env, responseData, url, chatId) {
 	try {
 		const messageId = responseData && responseData.result ? responseData.result.message_id : null;
 		if (!messageId) return;
 
-		const ua = UA;
-
-		// 四种格式的具体内容
-		const linkDirect = url;
-		const linkHtml = '<img src="' + url + '">';
-		const linkMarkdown = '![图片](' + url + ')';
-		const linkBBCode = '[img]' + url + '[/img]';
-
-		// 方案 A：给图片挂四个「点击即复制」按钮，排成两行两列
-		const replyMarkup = {
-			inline_keyboard: [
-				[
-					{ text: '图片直链', copy_text: { text: linkDirect } },
-					{ text: 'HTML', copy_text: { text: linkHtml } }
-				],
-				[
-					{ text: 'Markdown', copy_text: { text: linkMarkdown } },
-					{ text: 'BBCode', copy_text: { text: linkBBCode } }
-				]
-			]
-		};
-
+		// 方案 A：挂「1 个打开 + 4 个复制」按钮
 		const btnRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageReplyMarkup`, {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'User-Agent': ua
+				'User-Agent': UA
 			},
 			body: JSON.stringify({
-				chat_id: env.TG_CHAT_ID,
+				chat_id: chatId,
 				message_id: messageId,
-				reply_markup: replyMarkup
+				reply_markup: buildKeyboard(url)
 			}),
 		});
 		const btnData = await btnRes.json();
 		if (btnData && btnData.ok) return;
 
 		// 方案 B（兜底）：挂按钮失败，就把四种格式写进说明文字
-		let fallbackCaption = '图片直链：\n' + linkDirect +
-			'\n\nHTML：\n' + linkHtml +
-			'\n\nMarkdown：\n' + linkMarkdown +
-			'\n\nBBCode：\n' + linkBBCode;
-
-		// Telegram 的说明文字上限是 1024 字符；正常图片远低于此，
-		// 仅对极端长的 file_id 做一次截断保护，避免请求被直接拒绝。
-		if (fallbackCaption.length > 1024) {
-			fallbackCaption = fallbackCaption.slice(0, 1023) + '…';
-		}
-
 		await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'User-Agent': ua
+				'User-Agent': UA
 			},
 			body: JSON.stringify({
-				chat_id: env.TG_CHAT_ID,
+				chat_id: chatId,
 				message_id: messageId,
-				caption: fallbackCaption
+				caption: buildCaption(url)
 			}),
 		});
 	} catch (error) {
@@ -359,40 +365,6 @@ const getFile = async (response) => {
 		return null;
 	}
 };
-
-
-
-async function insertImageData(DB, src, referer, ip, rating, time) {
-	// ★ 参数化写入。
-	// 原来是把 ${referer} / ${ip} 直接拼进 SQL 字符串 —— 而这两个值来自请求头
-	// （Referer、x-forwarded-for），任何访问者都能随手改。绑上 D1 之后，
-	// 这就是一条真实可被利用的注入通道。
-	// 同时去掉了原来那个空 catch：写库失败不再被静默吞掉。
-	await DB.prepare(
-		`INSERT INTO imginfo (url, referer, ip, rating, total, time)
-		 VALUES (?, ?, ?, ?, 1, ?)`
-	).bind(src, referer, ip, rating, time).run();
-}
-
-
-
-async function get_nowTime() {
-	const options = {
-		timeZone: 'Asia/Shanghai',
-		year: 'numeric',
-		month: 'long',
-		day: 'numeric',
-		hour12: false,
-		hour: '2-digit',
-		minute: '2-digit',
-		second: '2-digit'
-	};
-	const timedata = new Date();
-	const formattedDate = new Intl.DateTimeFormat('zh-CN', options).format(timedata);
-
-	return formattedDate
-
-}
 
 
 
