@@ -9,6 +9,8 @@
 // 新增/用到的两张表（运行时自动创建，无需手工执行 SQL）：
 //   botstate(key TEXT PRIMARY KEY, value TEXT)
 //       —— 存各种"上次到哪儿了"的标记（播报位点、体检状态、webhook 地址）
+//          其中 usage_msg_id / usage_pin_msg_id 记的是"上一条使用说明"，
+//          用来在重复执行 /setup 时把旧的那条清掉（取消置顶 + 删除），避免堆积。
 //   tgmsg(file_id TEXT PRIMARY KEY, chat_id TEXT, message_id INTEGER, kind TEXT, ts TEXT)
 //       —— file_id ↔ 频道消息 message_id 的映射。删图要靠它定位消息。
 //
@@ -699,6 +701,52 @@ export async function buildDailyReport({ env, db, origin }) {
 // 一次性设置
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 关于「置顶」的两个开关
+//
+// 背景（很重要，否则会一直以为是自己代码的问题）：
+// Telegram 官方行为 —— 频道绑定讨论组之后，
+//   「New posts from the channel will be automatically forwarded to the group
+//     and pinned there.」
+// 也就是：**频道每发一条新消息，Telegram 都会自动往讨论组转发一份并把它置顶**。
+// 图片一张张传进去，讨论组的置顶区就会被刷满。Telegram 自己没给关闭开关，
+// 所以只能在"收到的瞬间"把它取消掉 —— 这就是 AUTO_UNPIN 存在的唯一原因。
+//
+// 另一处置顶是我们自己做的：/setup 时把"使用说明"置顶在存储频道里（一次性）。
+// ---------------------------------------------------------------------------
+
+function isOffValue(v) {
+  return /^(off|false|0|no|disable|disabled)$/i.test(String(v == null ? '' : v).trim());
+}
+
+/**
+ * AUTO_UNPIN —— 讨论组里的自动取消置顶。三种取值：
+ *   不设 / on / true      → 只取消"刚转发进来的那一条"（默认）
+ *   all                   → 顺手把该讨论组的置顶**全部**清掉（可用于清理历史积累）
+ *   off / false / 0 / no  → 什么都不做，保留 Telegram 的自动置顶
+ *
+ * 默认开启，因为绑了讨论组的图床频道，置顶区被图片刷满几乎没有意义。
+ */
+export function autoUnpinMode(env) {
+  const v = String((env && env.AUTO_UNPIN) || '').trim().toLowerCase();
+  if (isOffValue(v)) return 'off';
+  if (v === 'all') return 'all';
+  return 'single';
+}
+
+export function autoUnpinEnabled(env) {
+  return autoUnpinMode(env) !== 'off';
+}
+
+/**
+ * PIN_USAGE —— /setup 时是否在存储频道里置顶"使用说明"。默认开启（保持原行为）。
+ * 设为 off 之后：不再发送、也不置顶这条说明；并且会把**上一次记录下来的那条**
+ * 取消置顶并删除（避免反复 /setup 在频道里堆一串说明）。
+ */
+export function pinUsageEnabled(env) {
+  return !isOffValue(env && env.PIN_USAGE);
+}
+
 export async function setupBot({ env, tg, origin, db }) {
   await ensureSchema(db);
   const steps = [];
@@ -721,32 +769,73 @@ export async function setupBot({ env, tg, origin, db }) {
     detail: (mc && mc.ok) ? '在私聊里输入 / 就能看到菜单' : ((mc && mc.description) || '失败')
   });
 
-  const sent = await tg.call('sendMessage', {
-    chat_id: String(env.TG_CHAT_ID),
-    text: channelUsageText(origin),
-    parse_mode: 'HTML',
-    disable_web_page_preview: true
-  });
-  if (!sent || !sent.ok) {
+  // --- 使用说明：先清掉上一次留下的那条，避免反复 /setup 在频道里堆一串 ---
+  const prevMsgId = await getState(db, 'usage_msg_id');
+  const prevPinId = await getState(db, 'usage_pin_msg_id');
+  if (prevPinId) {
+    const un = await tg.call('unpinChatMessage', {
+      chat_id: String(env.TG_CHAT_ID), message_id: Number(prevPinId)
+    });
+    steps.push({
+      step: '清掉上一次置顶的使用说明',
+      ok: !!(un && un.ok),
+      detail: (un && un.ok)
+        ? `已取消置顶（message_id ${prevPinId}）`
+        : (((un && un.description) || '取消置顶失败') + ' —— 可忽略（可能已被你手动取消）')
+    });
+    await setState(db, 'usage_pin_msg_id', '');
+  }
+  if (prevMsgId) {
+    const dl = await tg.call('deleteMessage', {
+      chat_id: String(env.TG_CHAT_ID), message_id: Number(prevMsgId)
+    });
+    steps.push({
+      step: '删掉上一次的使用说明',
+      ok: !!(dl && dl.ok),
+      detail: (dl && dl.ok)
+        ? `已删除（message_id ${prevMsgId}）`
+        : (((dl && dl.description) || '删除失败') + ' —— 可忽略（超过 48 小时删不掉，手动删一下即可）')
+    });
+    await setState(db, 'usage_msg_id', '');
+  }
+
+  if (!pinUsageEnabled(env)) {
+    // 明确关掉了：既不发送、也不置顶。这样频道里不会再多出一条没人看的说明。
     steps.push({
       step: '在频道里置顶使用说明',
-      ok: false,
-      detail: (sent && sent.description) || '发送失败'
+      ok: true,
+      detail: '已跳过（PIN_USAGE 设为关闭）'
     });
   } else {
-    const mid = sent.result.message_id;
-    const pinned = await tg.call('pinChatMessage', {
+    const sent = await tg.call('sendMessage', {
       chat_id: String(env.TG_CHAT_ID),
-      message_id: mid,
-      disable_notification: true
+      text: channelUsageText(origin),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true
     });
-    steps.push({
-      step: '在频道里置顶使用说明',
-      ok: !!(pinned && pinned.ok),
-      detail: (pinned && pinned.ok)
-        ? `已置顶（message_id ${mid}）`
-        : (((pinned && pinned.description) || '置顶失败') + ' —— bot 需要频道的「置顶消息」权限')
-    });
+    if (!sent || !sent.ok) {
+      steps.push({
+        step: '在频道里置顶使用说明',
+        ok: false,
+        detail: (sent && sent.description) || '发送失败'
+      });
+    } else {
+      const mid = sent.result.message_id;
+      await setState(db, 'usage_msg_id', mid);
+      const pinned = await tg.call('pinChatMessage', {
+        chat_id: String(env.TG_CHAT_ID),
+        message_id: mid,
+        disable_notification: true
+      });
+      if (pinned && pinned.ok) await setState(db, 'usage_pin_msg_id', mid);
+      steps.push({
+        step: '在频道里置顶使用说明',
+        ok: !!(pinned && pinned.ok),
+        detail: (pinned && pinned.ok)
+          ? `已置顶（message_id ${mid}）`
+          : (((pinned && pinned.description) || '置顶失败') + ' —— bot 需要频道的「置顶消息」权限')
+      });
+    }
   }
 
   return { origin, webhookUrl, steps };
@@ -779,8 +868,66 @@ export async function handleUpdate({ update, env, tg, db, origin, fetchImpl = fe
     return handlePrivateMessage({ msg, env, tg, db, origin, fetchImpl, cachesImpl });
   }
 
+  // 频道新帖被自动转发到绑定的讨论组时，Telegram 会顺手把它**置顶**（官方行为）。
+  // 就在它刚到的这一刻取消掉 —— 见文件开头 AUTO_UNPIN 的说明。
+  // 这类消息的正文是频道帖的原文，不会是「删除」两个字，所以处理完直接返回即可。
+  if (msg.is_automatic_forward) {
+    return handleAutoForward({ msg, env, tg });
+  }
+
   // 群/超级群：只关心"回复某张图 + 说删除"
   return handleGroupDeleteReply({ msg, env, tg, db, origin, cachesImpl });
+}
+
+/**
+ * 处理「频道新帖被自动转发到讨论组」的那条消息 —— 顺手取消它的置顶。
+ *
+ * 存在的唯一原因：这是 Telegram 的官方行为。频道绑了讨论组之后，
+ * 频道每发一条新消息，Telegram 都会自动往讨论组转发一份**并把它置顶**
+ * （官方原文：New posts from the channel will be automatically forwarded to
+ *   the group and pinned there.）。图床每传一张图就置顶一条，置顶区很快被刷满。
+ * Telegram 没有给关闭这个行为的开关，只能在"收到的那一刻"取消掉。
+ *
+ * 前提：bot 得在讨论组里**有权置顶**（通常就是把 bot 设成群管理员并勾选「置顶消息」）。
+ */
+async function handleAutoForward({ msg, env, tg }) {
+  const mode = autoUnpinMode(env);
+  if (mode === 'off') {
+    return { handled: true, kind: 'auto-forward', unpinned: false, reason: 'auto-unpin-off' };
+  }
+
+  const chatId = msg.chat && msg.chat.id;
+
+  if (mode === 'all') {
+    const res = await tg.call('unpinAllChatMessages', { chat_id: chatId });
+    return {
+      handled: true,
+      kind: 'auto-forward',
+      mode: 'all',
+      unpinned: !!(res && res.ok),
+      chatId,
+      detail: (res && res.ok)
+        ? '已清空该讨论组的置顶'
+        : ((res && res.description) || '清空置顶失败')
+    };
+  }
+
+  const res = await tg.call('unpinChatMessage', {
+    chat_id: chatId,
+    message_id: msg.message_id
+  });
+  return {
+    handled: true,
+    kind: 'auto-forward',
+    mode: 'single',
+    unpinned: !!(res && res.ok),
+    chatId,
+    messageId: msg.message_id,
+    detail: (res && res.ok)
+      ? '已取消置顶'
+      : (((res && res.description) || '取消置顶失败') +
+         ' —— bot 需要在讨论组里有「置顶消息」权限（把 bot 设成群管理员并勾上它）')
+  };
 }
 
 function idText(msg, env) {
