@@ -71,6 +71,10 @@ export async function POST(request) {
 			"code": 200,
 			"name": fileData.file_name
 		}
+
+		// ===== 新增：把生成的图片链接也显示在 TG 频道里 =====
+		await sendLinkToChannel(env, responseData, data.url);
+
 		if (!env.IMG) {
 			data.env_img = "null"
 			return Response.json({
@@ -119,7 +123,6 @@ export async function POST(request) {
 
 
 
-
 	} catch (error) {
 		return Response.json({
 			status: 500,
@@ -132,6 +135,55 @@ export async function POST(request) {
 	}
 
 }
+
+
+// ===== 新增函数：把图片链接发到 TG 频道 =====
+// 策略 A（首选）：把链接写成那张图片的「说明文字(caption)」—— 频道里一条消息 = 一张图 + 一行链接，最干净，
+//                而且转发这张图片时链接会跟着一起走。
+// 策略 B（兜底）：若编辑说明文字失败（该消息类型不支持 caption 等情况），退化为「回复这张图片」单独发一条链接消息。
+// 链接发送失败不影响上传结果，只打印日志。
+async function sendLinkToChannel(env, responseData, url) {
+	try {
+		const messageId = responseData && responseData.result ? responseData.result.message_id : null;
+		if (!messageId) return;
+
+		const ua = " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0";
+
+		// 策略 A：把链接写进图片下方的说明文字
+		const editRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"User-Agent": ua
+			},
+			body: JSON.stringify({
+				chat_id: env.TG_CHAT_ID,
+				message_id: messageId,
+				caption: url
+			}),
+		});
+		const editData = await editRes.json();
+		if (editData && editData.ok) return;
+
+		// 策略 B（兜底）：改不动说明文字时，以「回复这张图片」的方式单独发一条链接
+		await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"User-Agent": ua
+			},
+			body: JSON.stringify({
+				chat_id: env.TG_CHAT_ID,
+				text: url,
+				reply_to_message_id: messageId,
+				disable_notification: true
+			}),
+		});
+	} catch (error) {
+		console.log('sendLinkToChannel error:', error && error.message);
+	}
+}
+
 
 async function getFile_path(env, file_id) {
 	try {
