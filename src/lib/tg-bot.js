@@ -9,8 +9,8 @@
 // 新增/用到的两张表（运行时自动创建，无需手工执行 SQL）：
 //   botstate(key TEXT PRIMARY KEY, value TEXT)
 //       —— 存各种"上次到哪儿了"的标记（播报位点、体检状态、webhook 地址）
-//          其中 usage_msg_id / usage_pin_msg_id 记的是"上一条使用说明"，
-//          用来在重复执行 /setup 时把旧的那条清掉（取消置顶 + 删除），避免堆积。
+//          （历史上还用过 usage_msg_id / usage_pin_msg_id 记录"上一条使用说明"，
+//            随该功能一起删除了；如果旧库里还留着这两行，属于无害的历史残留。）
 //   tgmsg(file_id TEXT PRIMARY KEY, chat_id TEXT, message_id INTEGER, kind TEXT, ts TEXT)
 //       —— file_id ↔ 频道消息 message_id 的映射。删图要靠它定位消息。
 //
@@ -172,19 +172,10 @@ function helpText(origin) {
   ].join('\n');
 }
 
-function channelUsageText(origin) {
-  return [
-    '📌 <b>这个频道是图床的存储后端</b>',
-    '',
-    '每张图片下方都有按钮：',
-    '🔍 <b>打开图片</b> — 点一下直接看图（发给朋友最省事）',
-    '<b>图片直链 / HTML / Markdown / BBCode</b> — 点一下复制对应格式',
-    '',
-    `链接长这样：${escapeHtml(origin)}/i/&lt;file_id&gt;.&lt;扩展名&gt;`,
-    '',
-    '图片请勿删除——删了图床上的链接就失效了。'
-  ].join('\n');
-}
+// 注：原本这里还有一个 channelUsageText()，用来生成「发到频道并置顶」的说明文字。
+// 该功能已彻底删除（原因见 setupBot() 里的注释），函数一并移除，
+// 以保证这段文字**不存在于代码里**、不可能再被发出去。
+// 频道里的用法说明统一走私聊 /help（见上面的 helpText()）。
 
 // ---------------------------------------------------------------------------
 // 频道消息 → 落库
@@ -702,7 +693,7 @@ export async function buildDailyReport({ env, db, origin }) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// 关于「置顶」的两个开关
+// 关于「置顶」：现在只剩 AUTO_UNPIN 一个开关
 //
 // 背景（很重要，否则会一直以为是自己代码的问题）：
 // Telegram 官方行为 —— 频道绑定讨论组之后，
@@ -712,7 +703,8 @@ export async function buildDailyReport({ env, db, origin }) {
 // 图片一张张传进去，讨论组的置顶区就会被刷满。Telegram 自己没给关闭开关，
 // 所以只能在"收到的瞬间"把它取消掉 —— 这就是 AUTO_UNPIN 存在的唯一原因。
 //
-// 另一处置顶是我们自己做的：/setup 时把"使用说明"置顶在存储频道里（一次性）。
+// ⚠️ 另一处置顶（/setup 时往存储频道发一条"使用说明"并置顶）**已从代码里彻底删除**。
+//    原因见 setupBot() 里那段注释。现在频道里只会出现「你上传的图片」本身。
 // ---------------------------------------------------------------------------
 
 function isOffValue(v) {
@@ -738,15 +730,6 @@ export function autoUnpinEnabled(env) {
   return autoUnpinMode(env) !== 'off';
 }
 
-/**
- * PIN_USAGE —— /setup 时是否在存储频道里置顶"使用说明"。默认开启（保持原行为）。
- * 设为 off 之后：不再发送、也不置顶这条说明；并且会把**上一次记录下来的那条**
- * 取消置顶并删除（避免反复 /setup 在频道里堆一串说明）。
- */
-export function pinUsageEnabled(env) {
-  return !isOffValue(env && env.PIN_USAGE);
-}
-
 export async function setupBot({ env, tg, origin, db }) {
   await ensureSchema(db);
   const steps = [];
@@ -769,74 +752,19 @@ export async function setupBot({ env, tg, origin, db }) {
     detail: (mc && mc.ok) ? '在私聊里输入 / 就能看到菜单' : ((mc && mc.description) || '失败')
   });
 
-  // --- 使用说明：先清掉上一次留下的那条，避免反复 /setup 在频道里堆一串 ---
-  const prevMsgId = await getState(db, 'usage_msg_id');
-  const prevPinId = await getState(db, 'usage_pin_msg_id');
-  if (prevPinId) {
-    const un = await tg.call('unpinChatMessage', {
-      chat_id: String(env.TG_CHAT_ID), message_id: Number(prevPinId)
-    });
-    steps.push({
-      step: '清掉上一次置顶的使用说明',
-      ok: !!(un && un.ok),
-      detail: (un && un.ok)
-        ? `已取消置顶（message_id ${prevPinId}）`
-        : (((un && un.description) || '取消置顶失败') + ' —— 可忽略（可能已被你手动取消）')
-    });
-    await setState(db, 'usage_pin_msg_id', '');
-  }
-  if (prevMsgId) {
-    const dl = await tg.call('deleteMessage', {
-      chat_id: String(env.TG_CHAT_ID), message_id: Number(prevMsgId)
-    });
-    steps.push({
-      step: '删掉上一次的使用说明',
-      ok: !!(dl && dl.ok),
-      detail: (dl && dl.ok)
-        ? `已删除（message_id ${prevMsgId}）`
-        : (((dl && dl.description) || '删除失败') + ' —— 可忽略（超过 48 小时删不掉，手动删一下即可）')
-    });
-    await setState(db, 'usage_msg_id', '');
-  }
-
-  if (!pinUsageEnabled(env)) {
-    // 明确关掉了：既不发送、也不置顶。这样频道里不会再多出一条没人看的说明。
-    steps.push({
-      step: '在频道里置顶使用说明',
-      ok: true,
-      detail: '已跳过（PIN_USAGE 设为关闭）'
-    });
-  } else {
-    const sent = await tg.call('sendMessage', {
-      chat_id: String(env.TG_CHAT_ID),
-      text: channelUsageText(origin),
-      parse_mode: 'HTML',
-      disable_web_page_preview: true
-    });
-    if (!sent || !sent.ok) {
-      steps.push({
-        step: '在频道里置顶使用说明',
-        ok: false,
-        detail: (sent && sent.description) || '发送失败'
-      });
-    } else {
-      const mid = sent.result.message_id;
-      await setState(db, 'usage_msg_id', mid);
-      const pinned = await tg.call('pinChatMessage', {
-        chat_id: String(env.TG_CHAT_ID),
-        message_id: mid,
-        disable_notification: true
-      });
-      if (pinned && pinned.ok) await setState(db, 'usage_pin_msg_id', mid);
-      steps.push({
-        step: '在频道里置顶使用说明',
-        ok: !!(pinned && pinned.ok),
-        detail: (pinned && pinned.ok)
-          ? `已置顶（message_id ${mid}）`
-          : (((pinned && pinned.description) || '置顶失败') + ' —— bot 需要频道的「置顶消息」权限')
-      });
-    }
-  }
+  // --- 这里原本会「往频道发一条使用说明 + 置顶」。现已彻底删除（2026-09-18）---
+  //
+  // 为什么删掉：
+  //   1) 频道的定位是「图片存储后端」，**只应该出现用户自己上传的图片**。
+  //      一条置顶的说明文字属于噪音；而且它本来也不是必需品 ——
+  //      用法随时可以在私聊里发 /help 查（helpText() 就是同一份内容）。
+  //   2) 上一版用 PIN_USAGE 变量控制"发不发"。但开关本身就是多余的：
+  //      与其让用户多配一个变量、多一个"加了没生效"的坑，不如直接不要这段逻辑。
+  //   3) 旧版本已经发出去的那几条说明，**代码回收不了**（当时没记录 message_id），
+  //      只能手动删 —— 这更是"索性别再发"的理由。
+  //
+  // 所以 setupBot() 现在只做两件事：注册 webhook、注册命令菜单。
+  // 频道里从此只会出现「上传的图片」本身（以及 Telegram 自己的服务消息，如"某某添加了机器人"）。
 
   return { origin, webhookUrl, steps };
 }
