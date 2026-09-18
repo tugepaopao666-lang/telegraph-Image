@@ -72,8 +72,8 @@ export async function POST(request) {
 			"name": fileData.file_name
 		}
 
-		// ===== 新增：把生成的图片链接也显示在 TG 频道里 =====
-		await sendLinkToChannel(env, responseData, data.url);
+		// ===== 新增：给频道里的图片挂上「点一下就复制」的格式按钮 =====
+		await sendLinkButtons(env, responseData, data.url);
 
 		if (!env.IMG) {
 			data.env_img = "null"
@@ -137,50 +137,78 @@ export async function POST(request) {
 }
 
 
-// ===== 新增函数：把图片链接发到 TG 频道 =====
-// 策略 A（首选）：把链接写成那张图片的「说明文字(caption)」—— 频道里一条消息 = 一张图 + 一行链接，最干净，
-//                而且转发这张图片时链接会跟着一起走。
-// 策略 B（兜底）：若编辑说明文字失败（该消息类型不支持 caption 等情况），退化为「回复这张图片」单独发一条链接消息。
-// 链接发送失败不影响上传结果，只打印日志。
-async function sendLinkToChannel(env, responseData, url) {
+// ===== 给频道里的图片挂上三个「点击即复制」的格式按钮 =====
+// 效果：图片下方出现 [图片直链] [HTML] [Markdown] 三个按钮，
+//       点哪个就把对应格式的代码复制到剪贴板（Telegram 会弹「已复制」提示）。
+//
+// 实现方式：上传成功后调用 editMessageReplyMarkup，给那条图片消息追加一个内联键盘(inline_keyboard)。
+//           按钮类型用 copy_text（Telegram Bot API 的"复制文本"按钮），每种格式一个按钮。
+//
+// 三种格式：
+//   图片直链  https://你的域名/api/cfile/xxxxx
+//   HTML      <img src="https://你的域名/api/cfile/xxxxx">
+//   Markdown  ![图片](https://你的域名/api/cfile/xxxxx)
+//
+// 兜底：万一挂按钮失败（例如该消息类型不支持内联键盘），
+//       就把三种格式全部写进图片的「说明文字(caption)」，保证内容不丢。
+//       整个函数包在 try/catch 内，任何失败都不会影响网页端的上传结果。
+async function sendLinkButtons(env, responseData, url) {
 	try {
 		const messageId = responseData && responseData.result ? responseData.result.message_id : null;
 		if (!messageId) return;
 
 		const ua = " Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0";
 
-		// 策略 A：把链接写进图片下方的说明文字
-		const editRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
-			method: "POST",
+		// 三种格式的具体内容
+		const linkDirect = url;
+		const linkHtml = '<img src="' + url + '">';
+		const linkMarkdown = '![图片](' + url + ')';
+
+		// 方案 A：给图片挂三个「点击即复制」按钮
+		const replyMarkup = {
+			inline_keyboard: [
+				[
+					{ text: '图片直链', copy_text: { text: linkDirect } },
+					{ text: 'HTML', copy_text: { text: linkHtml } },
+					{ text: 'Markdown', copy_text: { text: linkMarkdown } }
+				]
+			]
+		};
+
+		const btnRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageReplyMarkup`, {
+			method: 'POST',
 			headers: {
-				"Content-Type": "application/json",
-				"User-Agent": ua
+				'Content-Type': 'application/json',
+				'User-Agent': ua
 			},
 			body: JSON.stringify({
 				chat_id: env.TG_CHAT_ID,
 				message_id: messageId,
-				caption: url
+				reply_markup: replyMarkup
 			}),
 		});
-		const editData = await editRes.json();
-		if (editData && editData.ok) return;
+		const btnData = await btnRes.json();
+		if (btnData && btnData.ok) return;
 
-		// 策略 B（兜底）：改不动说明文字时，以「回复这张图片」的方式单独发一条链接
-		await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-			method: "POST",
+		// 方案 B（兜底）：挂按钮失败，就把三种格式写进说明文字
+		const fallbackCaption = '图片直链：\n' + linkDirect +
+			'\n\nHTML：\n' + linkHtml +
+			'\n\nMarkdown：\n' + linkMarkdown;
+
+		await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageCaption`, {
+			method: 'POST',
 			headers: {
-				"Content-Type": "application/json",
-				"User-Agent": ua
+				'Content-Type': 'application/json',
+				'User-Agent': ua
 			},
 			body: JSON.stringify({
 				chat_id: env.TG_CHAT_ID,
-				text: url,
-				reply_to_message_id: messageId,
-				disable_notification: true
+				message_id: messageId,
+				caption: fallbackCaption
 			}),
 		});
 	} catch (error) {
-		console.log('sendLinkToChannel error:', error && error.message);
+		console.log('sendLinkButtons error:', error && error.message);
 	}
 }
 
