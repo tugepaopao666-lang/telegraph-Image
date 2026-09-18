@@ -11,6 +11,24 @@ import Footer from '@/components/Footer'
 import Link from "next/link";
 import LoadingOverlay from "@/components/LoadingOverlay";
 
+// ============================================================================
+// 2026-09-18 本轮修改记录（业主主动要求）
+//
+// ① 移除页面上那个「上传接口：TG_Channel ▾」下拉框。
+//    现在**固定只用 TG_Channel**（= 你自己的 Telegram 频道），
+//    不再提供 tg / r2 / 58img 等其它通道，所以页面上没有可选项了。
+//      · 删掉 <select> 整块、selectedOption 状态、handleSelectChange 函数；
+//      · handleUpload 里的目标地址直接写死 /api/enableauthapi/tgchannel；
+//      · 原来「未登录时自动切到 58img」的兜底也一并删除 —— 因为后台已经
+//        开了「必须登录才能上传」（ENABLE_AUTH_API = true），未登录本来
+//        就传不上去，静默切到一个外部图床反而更让人困惑。
+//
+// ② 401 的提示改成人话：原来是「无权限访问资源: ...」，现在是「请先登录后再上传」。
+//
+// ③ 修掉压缩阈值那行过期注释（它写着「压到 1.2MB 以内」，实际阈值是 8MB）。
+//
+// ④ 下面的压缩函数本身**保持不变**（它本来就在这个文件里，不必再单独粘一遍）。
+// ============================================================================
 
 const LoginButton = ({ onClick, href, children }) => (
   <button
@@ -21,8 +39,7 @@ const LoginButton = ({ onClick, href, children }) => (
   </button>
 );
 
-// ===== 新增：上传前在浏览器里先压一遍图片 =====
-// 【这一整段是新增的，请粘到 src/app/page.js 里 `export default function Home() {` 的上一行】
+// ===== 上传前在浏览器里先压一遍图片 =====
 
 // 为什么放在前端压：Cloudflare 的 Edge 运行时没有图像处理库，服务端压不了；
 // 而"传不上去"最常见的原因，就是手机随手拍的照片超过了 Telegram 的 10MB 上限。
@@ -32,7 +49,10 @@ const LoginButton = ({ onClick, href, children }) => (
 // 所以它不可能把一张原本能传的图弄成传不了。
 
 const COMPRESS_TRIGGER_BYTES = 10 * 1024 * 1024;  // 超过 10MB 才考虑压
-const COMPRESS_TARGET_BYTES = 8 * 1024 * 1024; // 目标：压到 1.2MB 以内
+// 目标大小：压到 8MB 以内。
+// ⚠️ 别把这个值改小去"多压一点" —— Telegram sendPhoto 的上限就是 10MB，
+//    只有超标才需要压；压过头只会白白掉画质。
+const COMPRESS_TARGET_BYTES = 8 * 1024 * 1024;
 const COMPRESS_MAX_EDGE = 2560;                  // 最长边不超过 2560 像素
 
 async function compressImageIfNeeded(file) {
@@ -106,7 +126,6 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [IP, setIP] = useState('');
   const [Total, setTotal] = useState('?');
-  const [selectedOption, setSelectedOption] = useState('tgchannel'); // 初始选择第一个选项
   const [isAuthapi, setisAuthapi] = useState(false); // 初始选择第一个选项
   const [Loginuser, setLoginuser] = useState(''); // 初始选择第一个选项
   const [boxType, setBoxtype] = useState("img");
@@ -170,7 +189,6 @@ export default function Home() {
 
       } else {
         setisAuthapi(false)
-        setSelectedOption("58img")
       }
 
 
@@ -236,7 +254,9 @@ export default function Home() {
       return;
     }
 
-    const formFieldName = selectedOption === "tencent" ? "media" : "file";
+    // 固定只走 TG_Channel（上传到自己的 Telegram 频道）—— 页面已无其它通道可选
+    const formFieldName = "file";
+    const targetUrl = "/api/enableauthapi/tgchannel";
     let successCount = 0;
 
     try {
@@ -246,10 +266,6 @@ export default function Home() {
         formData.append(formFieldName, await compressImageIfNeeded(file));
 
         try {
-          const targetUrl = selectedOption === "tgchannel" || selectedOption === "r2"
-            ? `/api/enableauthapi/${selectedOption}`
-            : `/api/${selectedOption}`;
-
           // const response = await fetch("https://img.131213.xyz/api/tencent", {
           const response = await fetch(targetUrl, {
             method: 'POST',
@@ -293,7 +309,9 @@ export default function Home() {
                 toast.error(`服务器错误: ${errorMsg}`);
                 break;
               case 401:
-                toast.error(`未授权: ${errorMsg}`);
+                // 后台开着「必须登录才能上传」（ENABLE_AUTH_API = true），
+                // 未登录时走这里。给一句人话，不要让人对着 "未授权" 发呆。
+                toast.error('请先登录后再上传');
                 break;
               default:
                 toast.error(`上传 ${file.name} 图片时出错: ${errorMsg}`);
@@ -521,10 +539,6 @@ export default function Home() {
     }
   };
 
-  const handleSelectChange = (e) => {
-    setSelectedOption(e.target.value); // 更新选择框的值
-  };
-
 
   const handleSignOut = () => {
     signOut({ callbackUrl: '/' });
@@ -573,23 +587,9 @@ export default function Home() {
               上传文件最大 10 MB;本站已托管 <span className="text-cyan-600">{Total}</span> 张图片; 你访问本站的IP是：<span className="text-cyan-600">{IP}</span>
             </div>
           </div>
-          <div className="flex  flex-col sm:flex-col   md:w-auto lg:flex-row xl:flex-row  2xl:flex-row  mx-auto items-center  ">
-            <span className=" text-lg sm:text-sm   md:text-sm lg:text-xl xl:text-xl  2xl:text-xl">上传接口：</span>
-            <select
-              value={selectedOption} // 将选择框的值绑定到状态中的 selectedOption
-              onChange={handleSelectChange} // 当选择框的值发生变化时触发 handleSelectChange 函数
-              className="text-lg p-2 border  rounded text-center w-auto sm:w-auto md:w-auto lg:w-auto xl:w-auto  2xl:w-36">
-              <option value="tg" >TG(会失效)</option>
-              <option value="tgchannel">TG_Channel</option>
-              <option value="r2">R2</option>
-              {/* <option value="vviptuangou">vviptuangou</option> */}
-              <option value="58img">58img</option>
-              {/* <option value="tencent">tencent</option> */}
-
-            </select>
-          </div>
-
-
+          {/* 原来这里有一个「上传接口：TG_Channel ▾」下拉框。
+              2026-09-18 已整块移除 —— 现在固定只上传到 TG_Channel，
+              没有可选项，所以不需要这个选择器。 */}
         </div>
         <div
           className="border-2 border-dashed border-slate-400 rounded-md relative"
