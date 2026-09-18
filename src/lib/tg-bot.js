@@ -818,7 +818,15 @@ export async function handleUpdate({ update, env, tg, db, origin, fetchImpl = fe
     return handleAutoForward({ msg, env, tg });
   }
 
-  // 群/超级群：只关心"回复某张图 + 说删除"
+  // 群/超级群里的 `/id`（2026-09-18 新增）。
+  // 只回管理员；用来查"这个群的真实 ID 是多少"，排查「回复删图没反应」时它是决定性的
+  // 一步（详见 handleGroupId 的说明）。注意：`/id` 是命令，即使 bot 开着隐私模式、
+  // 或者没被设为管理员，命令也能送达 —— 所以"发 /id 有回应"本身就说明"消息能到 bot"。
+  if (/^\/id(?:@\S+)?\s*$/i.test(String(msg.text || '').trim())) {
+    return handleGroupId({ msg, env, tg });
+  }
+
+  // 群/超级群：其余只关心"回复某张图 + 说删除"
   return handleGroupDeleteReply({ msg, env, tg, db, origin, cachesImpl });
 }
 
@@ -1079,6 +1087,62 @@ export function resolveChannelTarget(msg, env) {
 }
 
 /**
+ * 查一个群/频道的基本信息（只要标题）。用于"配置对不上"时给出人能看懂的对照。
+ * 查不到就把 Telegram 的原话带回来 —— 那本身就说明"这个 ID 是错的"。
+ */
+async function chatInfo(tg, id) {
+  try {
+    const r = await tg.call('getChat', { chat_id: String(id) });
+    if (r && r.ok && r.result) {
+      return { ok: true, title: r.result.title || r.result.first_name || '（无标题）' };
+    }
+    return { ok: false, title: '⚠️ 取不到（' + ((r && r.description) || '未知错误') + '）' };
+  } catch (e) {
+    return { ok: false, title: '⚠️ 取不到（' + ((e && e.message) || '请求异常') + '）' };
+  }
+}
+
+/**
+ * 群里的 `/id`（2026-09-18 新增）。
+ *
+ * 以前 `/id` 只在私聊有效、群里是**静默无响应**的。但排查「回复删图不生效」时，
+ * 第一步要确认的恰恰是"这个群的真实 ID 和后台 TG_GROUP_ID 是否一致" ——
+ * 没有它，业主只能自己去翻消息链接、手算 `-100` 前缀，门槛太高。
+ * 所以现在群里也认 `/id`，但**只回管理员**（其他人一律不回复，不暴露 bot）。
+ */
+async function handleGroupId({ msg, env, tg }) {
+  const chatId = String((msg.chat && msg.chat.id) || '');
+  const fromId = String((msg.from && msg.from.id) || '');
+  const adminId = env.TG_ADMIN_ID ? String(env.TG_ADMIN_ID) : '';
+  if (!adminId || fromId !== adminId) {
+    return { handled: true, cmd: 'id', reason: 'not-admin' };
+  }
+
+  const here = await chatInfo(tg, chatId);
+  const conf = env.TG_GROUP_ID ? await chatInfo(tg, String(env.TG_GROUP_ID)) : null;
+  const same = !!env.TG_GROUP_ID && String(env.TG_GROUP_ID) === chatId;
+
+  await reply(tg, chatId, [
+    '<b>本群信息</b>',
+    '',
+    '群名：<b>' + escapeHtml(here.title) + '</b>',
+    '群 ID：<code>' + escapeHtml(chatId) + '</code>',
+    '',
+    '<b>对照后台配置</b>',
+    '· <code>TG_GROUP_ID</code>：' + (env.TG_GROUP_ID
+      ? '<code>' + escapeHtml(String(env.TG_GROUP_ID)) + '</code>（' + escapeHtml(conf.title) + '）'
+        + (same ? ' ✅ <b>一致</b>' : ' ❌ <b>不一致 —— 「回复删图」会因此完全没反应</b>')
+      : '<b>没配</b> ❌'),
+    '· <code>TG_ADMIN_ID</code>：' + (adminId
+      ? '<code>' + escapeHtml(adminId) + '</code> ✅（与你的用户 ID 一致）'
+      : '<b>没配</b> ❌'),
+    '',
+    '你的用户 ID：<code>' + escapeHtml(fromId) + '</code>'
+  ].join('\n'));
+  return { handled: true, cmd: 'id', group: true, sameGroup: !!same, chatId };
+}
+
+/**
  * 频道讨论组里「回复某张图 + 发送删除」的流程。
  *
  * 安全上做了三重收紧，缺一不可：
@@ -1086,26 +1150,76 @@ export function resolveChannelTarget(msg, env) {
  *   2) 消息必须来自指定的那个讨论组（防止有人把 bot 拉进自己的群，
  *      回复一张转发来的图，就能删掉你频道里的内容）
  *   3) 发送者必须是管理员本人
+ *
+ * ⚠️ 2026-09-18 修的 bug（业主反馈「上个版本还能删，更新后在群里发删除 bot 完全没反应」）：
+ *    上面这三重锁在**不满足时是静默 return 的**。对陌生人保持沉默是对的
+ *    （不暴露 bot 的存在），但对**业主自己**就变成了最糟的体验：面板不报错、
+ *    日志要现开、他只能看到"没反应"，无从自查 —— 而实测最可能的原因就是
+ *    `TG_GROUP_ID` 和真实的群对不上（群里那份还被填成了「文本」类型）。
+ *    现在改成：**只要确认发消息的人就是管理员本人**，就把"为什么没执行"
+ *    连同两个群的 ID 与名称一起回给他。对其他人仍然一个字都不回。
+ *    判据：adminId 非空、且 msg.from.id === adminId（拿不到 adminId 就一律沉默）。
  */
 async function handleGroupDeleteReply({ msg, env, tg, db, origin, cachesImpl }) {
   const text = String(msg.text || '').trim();
   const isDeleteWord = /(删除|下架)/.test(text) || /^(delete|del|remove)\b/i.test(text);
   if (!isDeleteWord) return { handled: false, reason: 'not-delete-keyword' };
 
-  if (!env.TG_ADMIN_ID || !env.TG_GROUP_ID) {
+  const chatId = String((msg.chat && msg.chat.id) || '');
+  const fromId = String((msg.from && msg.from.id) || '');
+  const adminId = env.TG_ADMIN_ID ? String(env.TG_ADMIN_ID) : '';
+  const isAdmin = !!adminId && fromId === adminId;
+
+  // ---- ① 配置不完整 ----
+  if (!adminId || !env.TG_GROUP_ID) {
+    if (isAdmin) {
+      const miss = [];
+      if (!adminId) miss.push('TG_ADMIN_ID');
+      if (!env.TG_GROUP_ID) miss.push('TG_GROUP_ID');
+      await reply(tg, chatId,
+        '⚠️ 「回复删图」暂时用不了 —— 后台少配了 '
+        + miss.map((m) => '<code>' + m + '</code>').join(' / ') + '。\n\n'
+        + '到 Cloudflare → 你的 Pages 项目 → Settings → Variables and Secrets 补上（类型选「机密」），'
+        + '然后重新部署一次即可。');
+      return { handled: true, reason: 'not-configured', notified: true };
+    }
     return { handled: false, reason: 'not-configured' };
   }
-  if (String(msg.chat && msg.chat.id) !== String(env.TG_GROUP_ID)) {
+
+  // ---- ② 这条消息不是来自配置的那个讨论组 ----
+  if (chatId !== String(env.TG_GROUP_ID)) {
+    if (isAdmin) {
+      // 顺手把两边都查出来，直接指出"到底哪里对不上" —— 这是最难自查的一种坏法
+      const here = await chatInfo(tg, chatId);
+      const conf = await chatInfo(tg, String(env.TG_GROUP_ID));
+      await reply(tg, chatId, [
+        '⚠️ 我<b>没有执行</b>删除，因为这条消息来自的群，和后台配置的那个群对不上：',
+        '',
+        '· 你现在这个群：<b>' + escapeHtml(here.title) + '</b>',
+        '　ID <code>' + escapeHtml(chatId) + '</code>',
+        '· 后台 <code>TG_GROUP_ID</code> 配的是：<b>' + escapeHtml(conf.title) + '</b>',
+        '　ID <code>' + escapeHtml(String(env.TG_GROUP_ID)) + '</code>',
+        '',
+        '如果你就是要在<b>这个群</b>里用「回复删图」，'
+        + '把 <code>TG_GROUP_ID</code> 改成 <code>' + escapeHtml(chatId) + '</code>'
+        + '（类型选「机密」），然后重新部署。',
+        '',
+        '<i>（这条提示只发给管理员本人；别人发同样的词我一个字都不会回。）</i>'
+      ].join('\n'));
+      return { handled: true, reason: 'other-chat', notified: true };
+    }
     return { handled: false, reason: 'other-chat' };
   }
-  if (String(msg.from && msg.from.id) !== String(env.TG_ADMIN_ID)) {
-    return { handled: false, reason: 'not-admin' };
-  }
+
+  // ---- ③ 不是管理员本人：保持沉默（原设计，不向陌生人暴露这个 bot）----
+  if (!isAdmin) return { handled: false, reason: 'not-admin' };
 
   const target = resolveChannelTarget(msg, env);
   if (!target) {
     await reply(tg, msg.chat.id,
-      '没找到这条回复对应的频道图片。请**直接回复频道那张图**（它会被自动转发到本讨论组）。');
+      '⚠️ 消息我收到了，但<b>没找到它回复的那张频道图</b>。\n\n'
+      + '正确姿势：在讨论组里<b>长按那张自动转发过来的图 → 回复 → 发送「删除」</b>。\n'
+      + '<i>（只是单独发一句「删除」、或者回复了一条普通消息，都会看到这条提示。）</i>');
     return { handled: true, reason: 'no-target' };
   }
 
