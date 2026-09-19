@@ -6,20 +6,40 @@ import TooltipItem from '@/components/Tooltip';
 import FullScreenIcon from "@/components/FullScreenIcon"
 import { PhotoProvider, PhotoView } from 'react-photo-view';
 
+// ============================================================================
+// src/components/Table.jsx —— 后台列表
+//
+// ⚠️ 2026-09-19 改动（在原版基础上）：
+//   ① 新增「批量删除」：每行前面加了勾选框 + 表头全选，选中的会被一次删掉
+//      （调的还是 /api/admin/delete，只是多传一个 names 数组）。
+//   ② 删除提示改了文案：现在是**真删**（连同频道里的图片一起删），所以明确告诉你
+//      "删了找不回来"，不再是一句轻飘飘的"你确定要删除这个项目吗？"。
+//   ③ 点开图片名（原来只有四种格式）的详情弹窗里，补上了**上传时间 / 访问量 /
+//      来源 / IP / 鉴黄等级 / file_id**，还有一个"在新窗口打开原图"。
+//      —— 这就是你要的"单图详情"，不另开一个页面：表格里本来就有这些字段，
+//         做成弹窗比多一个页面更省事，也不用来回跳。
+//   ④ 删除成功后的提示会带上明细（删了几条频道消息 / 清了几行库），
+//      这样"删了但链接还能打开"你一眼就知道是缓存没清掉。
+// ============================================================================
+
 export default function Table({ data: initialData = [] }) {
 
     const [data, setData] = useState(initialData); // 初始化状态
     const [modalData, setModalData] = useState(null);
     const modalRef = useRef(null);
 
+    // ---- 2026-09-19 新增：批量选择 ----
+    const [selected, setSelected] = useState([]);
+    const [batchDeleting, setBatchDeleting] = useState(false);
+
 
 
     useEffect(() => {
         setData(initialData); // 更新数据
+        setSelected([]);      // 换页/换搜索词时清空选择（免得删到看不见的那些行）
     }, [initialData]);
 
     const handleClickOutside = (e) => {
-        console.log(modalRef.current.contains(e.target));
         if (modalRef.current && !modalRef.current.contains(e.target)) {
             setModalData(null);
         }
@@ -52,7 +72,11 @@ export default function Table({ data: initialData = [] }) {
 
 
 
-    const deleteItem = async (initName) => {
+    /**
+     * 删一条或多条：走同一个接口（多传一个 names 数组）。
+     * 后端现在会**连频道里那条图片一起删**，所以调用前必须确认过。
+     */
+    const deleteItems = async (names) => {
         try {
             const res = await fetch(`/api/admin/delete`, {
                 method: 'DELETE',
@@ -60,27 +84,73 @@ export default function Table({ data: initialData = [] }) {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
-                    name: initName,
+                    names: names,
                 }),
             });
             const res_data = await res.json();
-            if (res_data.success) {
-                toast.success('删除成功!');
-                setData(prevData => prevData.filter(item => item.url !== initName));
-            } else {
-                toast.error(res_data.message);
+            if (res_data && res_data.success) {
+                let msg = `已删除 ${res_data.count} 条`;
+                if (typeof res_data.messageDeleted === 'number') {
+                    msg += `（频道里的图片删掉 ${res_data.messageDeleted} 条）`;
+                }
+                if (typeof res_data.dbRows === 'number') {
+                    msg += `，数据库清理 ${res_data.dbRows} 行`;
+                }
+                toast.success(msg);
+                if (res_data.notes && res_data.notes.length) {
+                    toast.info(res_data.notes.slice(0, 3).join('；'), { autoClose: 8000 });
+                }
+                setData(prevData => prevData.filter(item => !names.includes(item.url)));
+                setSelected([]);
+                return true;
             }
+            toast.error((res_data && res_data.message) || '删除失败');
+            return false;
         } catch (error) {
             toast.error(error.message);
+            return false;
         }
     };
 
 
     const handleDelete = async (initName) => {
-        const confirmed = window.confirm('你确定要删除这个项目吗？');
+        const confirmed = window.confirm(
+            '确定要删除吗？\n\n' +
+            '注意：现在会**连频道里的那张图片一起删掉**，删了找不回来。'
+        );
         if (confirmed) {
-            await deleteItem(initName);
+            await deleteItems([initName]);
         }
+    };
+
+    /** 批量删除选中项 —— 2026-09-19 新增 */
+    const handleDeleteSelected = async () => {
+        if (!selected.length) return;
+        const confirmed = window.confirm(
+            `确定要删除选中的 ${selected.length} 条吗？\n\n` +
+            '注意：会**连频道里的这些图片一起删掉**，删了找不回来。'
+        );
+        if (!confirmed) return;
+        setBatchDeleting(true);
+        try {
+            await deleteItems(selected);
+        } finally {
+            setBatchDeleting(false);
+        }
+    };
+
+    /** 勾选/取消一条 —— 2026-09-19 新增 */
+    const toggleOne = (url) => {
+        setSelected((prev) => prev.includes(url)
+            ? prev.filter((u) => u !== url)
+            : prev.concat([url]));
+    };
+
+    /** 本页是否已全选 —— 2026-09-19 新增 */
+    const allSelected = data.length > 0 && data.every((it) => selected.includes(it.url));
+
+    const toggleAll = () => {
+        setSelected(allSelected ? [] : data.map((it) => it.url));
     };
 
 
@@ -154,10 +224,6 @@ export default function Table({ data: initialData = [] }) {
         }
     }
 
-    // const isImage = (url) => {
-    //     return /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(url);
-    // };
-
     const isVideo = (url) => {
         return /\.(mp4|mkv|avi|mov|wmv|flv|webm|ogg|ogv|m4v|3gp|3g2|mpg|mpeg|mxf|vob)$/i.test(url);
     }
@@ -165,9 +231,41 @@ export default function Table({ data: initialData = [] }) {
     const elementSize = 400;
     return (
         <div className="mx-2">
+            {/* 2026-09-19 新增：批量操作条 */}
+            <div className="flex items-center gap-3 my-2 px-2 flex-wrap">
+                <span className="text-sm text-gray-600">
+                    本页 {data.length} 条{selected.length ? `，已选 ${selected.length} 条` : ''}
+                </span>
+                {selected.length > 0 && (
+                    <>
+                        <button
+                            onClick={handleDeleteSelected}
+                            disabled={batchDeleting}
+                            className={`px-3 py-1 text-sm font-medium text-white rounded focus:outline-none ${batchDeleting ? 'bg-red-300 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'}`}
+                        >
+                            {batchDeleting ? '正在删除…' : `批量删除（${selected.length}）`}
+                        </button>
+                        <button
+                            onClick={() => setSelected([])}
+                            className="px-3 py-1 text-sm font-medium text-gray-700 bg-gray-100 rounded hover:bg-gray-200"
+                        >
+                            取消选择
+                        </button>
+                    </>
+                )}
+                <span className="text-xs text-gray-400">勾选左侧方框可多选；删除会连频道里的图片一起删掉</span>
+            </div>
             <table className="min-w-full bg-white  items-center justify-between ">
                 <thead >
                     <tr className="sticky top-0 bg-gray-100 z-20">
+                        <th className=" py-2 px-4 border-b border-gray-200 bg-gray-100  text-center text-sm font-semibold text-gray-600">
+                            <input
+                                type="checkbox"
+                                checked={allSelected}
+                                onChange={toggleAll}
+                                title="全选本页"
+                            />
+                        </th>
                         <th className=" py-2 px-4 border-b border-gray-200 bg-gray-100  text-center text-sm font-semibold text-gray-600">name</th>
                         <th className="sticky left-0 z-10 py-2 px-4 border-b border-gray-200 bg-gray-100 text-center text-sm font-semibold text-gray-600">preview</th>
                         <th className=" py-2 px-4 border-b border-gray-200 bg-gray-100  text-center text-sm font-semibold text-gray-600">time</th>
@@ -223,6 +321,13 @@ export default function Table({ data: initialData = [] }) {
 
                             <tr key={index}>
 
+                                <td className="text-center py-2 px-4 border-b border-gray-200">
+                                    <input
+                                        type="checkbox"
+                                        checked={selected.includes(item.url)}
+                                        onChange={() => toggleOne(item.url)}
+                                    />
+                                </td>
                                 <td onClick={() => handleNameClick(item)} className="text-center py-2 px-4 border-b border-gray-200 text-sm text-gray-700 truncate max-w-48">
                                     {item.url}
                                 </td>
@@ -303,7 +408,27 @@ export default function Table({ data: initialData = [] }) {
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
                             </svg>
                         </button>
-                        <div className='flex flex-col  mt-10'>
+                        <div className='flex flex-col mt-10 overflow-auto'>
+                            {/* 2026-09-19 新增：单图详情（上传时间 / 访问量 / 来源 / IP / 鉴黄 / file_id） */}
+                            <div className="mx-2 mb-2 px-3 py-2 bg-slate-50 rounded-lg text-sm text-gray-700 space-y-1">
+                                <div><span className="text-gray-500">file_id：</span><span className="break-all">{getLastSegment(modalData.url)}</span></div>
+                                <div><span className="text-gray-500">上传时间：</span>{modalData.time || '未知'}</div>
+                                <div><span className="text-gray-500">访问量（PV）：</span>{modalData.total == null ? '—' : modalData.total}</div>
+                                <div><span className="text-gray-500">来源：</span><span className="break-all">{modalData.referer || '(空)'}</span></div>
+                                <div><span className="text-gray-500">上传者 IP：</span>{modalData.ip || '(空)'}</div>
+                                <div><span className="text-gray-500">限制访问 / 鉴黄等级：</span>{modalData.rating == null ? '未检测' : modalData.rating}</div>
+                                <div>
+                                    <a
+                                        href={getImgUrl(modalData.url)}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="text-blue-600 underline"
+                                    >
+                                        在新窗口打开原图
+                                    </a>
+                                </div>
+                            </div>
+                            <div className="mx-2 text-xs text-gray-500 mb-1">点下面任意一行即可复制对应格式：</div>
                             {[
                                 { text: getImgUrl(modalData.url), onClick: () => handleCopy(getImgUrl(modalData.url)) },
                                 { text: `![${modalData.url}](${getImgUrl(modalData.url)})`, onClick: () => handleCopy(`![${modalData.name}](${getImgUrl(modalData.url)})`) },
