@@ -74,14 +74,19 @@ export async function POST(request) {
     const where = q ? 'WHERE url LIKE ?' : '';
     const searchBinds = q ? ['%' + q + '%'] : [];
 
-    const ps = env.IMG.prepare(
+    // ⚠️ 这里**千万别**写成 `.bind.apply(null, args)`（我第一版就是这么写的，线上直接 500）：
+    //    `Function.prototype.apply` 的第二个参数才是实参，第一个参数是 `this`。
+    //    传 null 等于把 this 丢了，而 Cloudflare D1 的 `bind()` 内部要用 this
+    //    （它读的是 this.dbSession）⇒ 报 "Cannot read properties of null (reading 'dbSession')"。
+    //    要"展开一个数组当参数"，直接用展开语法 `.bind(...arr)` 就行。
+    const listStmt = env.IMG.prepare(
       'SELECT * FROM imginfo ' + where + ' ' + order + ' LIMIT ? OFFSET ?'
-    ).bind.apply(null, searchBinds.concat([PAGE_SIZE, page * PAGE_SIZE]));
+    );
+    const ps = listStmt.bind(...searchBinds, PAGE_SIZE, page * PAGE_SIZE);
     const { results } = await ps.all();
 
-    const totalRow = await env.IMG.prepare(
-      'SELECT COUNT(*) as total FROM imginfo ' + where
-    ).bind.apply(null, searchBinds).first();
+    const countStmt = env.IMG.prepare('SELECT COUNT(*) as total FROM imginfo ' + where);
+    const totalRow = await (searchBinds.length ? countStmt.bind(...searchBinds) : countStmt).first();
 
     return Response.json({
       code: 200,
