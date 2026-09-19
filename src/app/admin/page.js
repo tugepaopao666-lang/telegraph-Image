@@ -4,8 +4,26 @@ import Table from "@/components/Table"
 import { useState, useEffect, useCallback } from 'react';
 import { ToastContainer, toast } from "react-toastify";
 import Link from 'next/link'
-// import { toast } from "react-toastify";
 
+// ============================================================================
+// src/app/admin/page.js —— 后台首页
+//
+// ⚠️ 2026-09-19 改动（在原版基础上）：
+//   ① 新增「排序」下拉框：最新优先（默认）/ 最早优先 / 访问最多 / 访问最少 / 鉴黄等级高→低。
+//      排序在服务端做（接口支持 sort/dir），所以是对**全部记录**排序，不是只排当前这一页。
+//   ② 切换排序时自动回到第 1 页（否则会停在一个页号上看到奇怪的结果）。
+//   ③ 搜索框改成**手机上也能用**（原版是 `hidden sm:flex`，手机上看不到搜索）。
+//
+// 说明：搜索和分页**本来就有**（原版就有），这次只是补上排序、并把搜索放到手机上。
+// ============================================================================
+
+const SORT_OPTIONS = [
+  { key: 'id-desc', label: '最新优先', sort: 'id', dir: 'desc' },
+  { key: 'id-asc', label: '最早优先', sort: 'id', dir: 'asc' },
+  { key: 'total-desc', label: '访问最多', sort: 'total', dir: 'desc' },
+  { key: 'total-asc', label: '访问最少', sort: 'total', dir: 'asc' },
+  { key: 'rating-desc', label: '鉴黄等级高→低', sort: 'rating', dir: 'desc' }
+];
 
 
 
@@ -16,10 +34,13 @@ export default function Admin() {
   const [inputPage, setInputPage] = useState(1);
   const [view, setView] = useState('list'); // 'list' 或 'log'，默认为 'list'
   const [searchQuery, setSearchQuery] = useState('');
+  // ---- 2026-09-19 新增：排序 ----
+  const [sortKey, setSortKey] = useState('id-desc');
 
 
 
   const getListdata = useCallback(async (page) => {
+    const opt = SORT_OPTIONS.find((o) => o.key === sortKey) || SORT_OPTIONS[0];
     try {
       const res = await fetch(`/api/admin/${view}`, {
         method: "POST",
@@ -30,6 +51,8 @@ export default function Admin() {
         body: JSON.stringify({
           page: (page - 1),
           query: searchQuery, // 传递搜索查询
+          sort: opt.sort,     // 2026-09-19 新增
+          dir: opt.dir        // 2026-09-19 新增
         })
       })
       const res_data = await res.json()
@@ -38,7 +61,7 @@ export default function Admin() {
       } else {
         setListData(res_data.data)
         const totalPages = Math.ceil(res_data.total / 10);
-        setSearchTotal(totalPages);
+        setSearchTotal(totalPages || 1);
       }
 
     } catch (error) {
@@ -50,7 +73,7 @@ export default function Admin() {
 
   useEffect(() => {
     getListdata(currentPage)
-  }, [currentPage, view]);
+  }, [currentPage, view, sortKey]);
 
   // 分页控制按钮
   const handleNextPage = () => {
@@ -100,33 +123,54 @@ export default function Admin() {
     getListdata(1);
   };
 
+  /** 换排序方式：回第 1 页再拉 —— 2026-09-19 新增 */
+  const handleSortChange = (e) => {
+    setSortKey(e.target.value);
+    setCurrentPage(1);
+    setInputPage(1);
+  };
+
   return (
     <>
       <div className="overflow-auto h-full flex w-full min-h-screen flex-col items-center justify-between">
-        <header className="fixed top-0 h-[50px]  left-0 w-full border-b bg-white flex z-50 justify-center items-center">
-          <div className="flex justify-between items-center w-full max-w-4xl px-4">
-            <button className='text-white px-4 py-2  transition ease-in-out delay-150 bg-blue-500 hover:scale-110 hover:bg-indigo-500 duration-300  rounded '
+        <header className="fixed top-0 min-h-[50px] left-0 w-full border-b bg-white flex z-50 flex-wrap justify-center items-center gap-2 py-1">
+          <div className="flex flex-wrap justify-center items-center w-full max-w-4xl px-2 gap-2">
+            <button className='text-white px-3 py-2 text-sm transition ease-in-out delay-150 bg-blue-500 hover:scale-110 hover:bg-indigo-500 duration-300  rounded '
               onClick={handleViewToggle}>
               切换到 {view === 'list' ? '日志页' : '数据页'}
             </button>
-            <form onSubmit={handleSearch} className="hidden sm:flex items-center">
+            {/* 2026-09-19：搜索框改成手机上也能用 */}
+            <form onSubmit={handleSearch} className="flex items-center">
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="border rounded p-2 w-40 mr-2"
-                placeholder="搜索"
+                className="border rounded p-2 w-32 sm:w-40 mr-2 text-sm"
+                placeholder="搜索链接"
               />
-              <button type="submit" className="text-white px-4 py-2 transition ease-in-out delay-150 bg-blue-500 hover:scale-110 hover:bg-indigo-500 duration-300 rounded">
+              <button type="submit" className="text-white px-3 py-2 text-sm transition ease-in-out delay-150 bg-blue-500 hover:scale-110 hover:bg-indigo-500 duration-300 rounded">
                 搜索
               </button>
             </form>
+            {/* 2026-09-19 新增：排序下拉 */}
+            <label className="flex items-center text-sm text-gray-600">
+              排序
+              <select
+                value={sortKey}
+                onChange={handleSortChange}
+                className="ml-2 border rounded p-2 text-sm bg-white"
+              >
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>{o.label}</option>
+                ))}
+              </select>
+            </label>
           </div>
-          <Link href="/"  className="hidden sm:flex"> <button className="px-4 py-2 mx-2 w-28  sm:w-28 md:w-20 lg:w-16 xl:w-16  2xl:w-20 bg-blue-500 text-white rounded ">主页</button></Link>
+          <Link href="/" className="hidden sm:flex"> <button className="px-4 py-2 mx-2 w-28  sm:w-28 md:w-20 lg:w-16 xl:w-16  2xl:w-20 bg-blue-500 text-white rounded ">主页</button></Link>
           <button onClick={() => signOut({ callbackUrl: "/" })} className="px-4 py-2 mx-2 w-28  sm:w-28 md:w-20 lg:w-16 xl:w-16  2xl:w-20 bg-blue-500 text-white rounded ">登出</button>
         </header>
 
-        <main className="my-[60px] w-9/10  sm:w-9/10 md:w-9/10 lg:w-9/10 xl:w-3/5 2xl:w-full">
+        <main className="my-[70px] w-9/10  sm:w-9/10 md:w-9/10 lg:w-9/10 xl:w-3/5 2xl:w-full">
 
           <Table data={listData} />
 
