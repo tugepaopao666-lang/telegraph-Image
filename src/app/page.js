@@ -29,6 +29,14 @@ import LoadingOverlay from "@/components/LoadingOverlay";
 //
 // ④ 下面的压缩函数本身**保持不变**（它本来就在这个文件里，不必再单独粘一遍）。
 // ============================================================================
+// 2026-09-19 本轮：首页体验 6 项
+//   ① 上传进度条（N/M + 百分比）
+//   ② 整页拖拽：拖到页面任何地方都能收，并有一层提示遮罩
+//   ③ 一键复制全部直链（每行一条）
+//   ④ 记住上次看的那一页（Preview / HTML / Markdown / BBCode / Links）
+//   ⑤ 手机上更紧凑（缩略图变小、链接区竖排）
+//   ⑥ 文案核对：把上传上限那句改成真实的两种上限（图片 10MB / 其它文件 50MB）
+// ============================================================================
 
 const LoginButton = ({ onClick, href, children }) => (
   <button
@@ -130,6 +138,10 @@ export default function Home() {
   const [Loginuser, setLoginuser] = useState(''); // 初始选择第一个选项
   const [boxType, setBoxtype] = useState("img");
 
+  // ---- 2026-09-19 新增：进度 / 拖拽 ----
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [dragActive, setDragActive] = useState(false);
+
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
 
 
@@ -150,7 +162,12 @@ export default function Home() {
     getTotal();
     isAuth();
 
-
+    // 记住上次看的那一页（2026-09-19 新增）。localStorage 在无痕/隐私模式下可能不可用，
+    // 所以整段包在 try 里 —— 存不了就不存，绝不能让页面因此出错。
+    try {
+      const savedTab = window.localStorage.getItem('tbc_active_tab');
+      if (savedTab) setActiveTab(savedTab);
+    } catch (e) { /* 忽略 */ }
   }, []);
   const ip = async () => {
     try {
@@ -254,6 +271,7 @@ export default function Home() {
       return;
     }
 
+    setProgress({ done: 0, total: filesToUpload.length });
     // 固定只走 TG_Channel（上传到自己的 Telegram 频道）—— 页面已无其它通道可选
     const formFieldName = "file";
     const targetUrl = "/api/enableauthapi/tgchannel";
@@ -320,6 +338,9 @@ export default function Home() {
         } catch (error) {
           toast.error(`上传 ${file.name} 图片时出错`);
         }
+
+        // 每处理完一个就推进一格（不区分成功失败 —— 进度条表达的是"处理到哪了"）
+        setProgress((p) => ({ done: p.done + 1, total: p.total || filesToUpload.length }));
       }
 
       setUploadedFilesNum(uploadedFilesNum + successCount);
@@ -330,6 +351,7 @@ export default function Home() {
       toast.error('上传错误');
     } finally {
       setUploading(false);
+      setProgress({ done: 0, total: 0 });
     }
   };
 
@@ -415,6 +437,42 @@ export default function Home() {
     }
   }
 
+  /** 一键复制全部直链（每行一条）—— 2026-09-19 新增 */
+  const handleCopyAll = async () => {
+    const urls = uploadedImages.map((d) => d.url).filter(Boolean);
+    if (!urls.length) {
+      toast.error('还没有上传成功的图片');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(urls.join('\n'));
+      toast.success(`已复制 ${urls.length} 条直链`);
+    } catch (err) {
+      toast.error('复制失败，请手动选中复制');
+    }
+  };
+
+  /** 切标签页并记住它 —— 2026-09-19 新增 */
+  const switchTab = (t) => {
+    setActiveTab(t);
+    try { window.localStorage.setItem('tbc_active_tab', t); } catch (e) { /* 忽略 */ }
+  };
+
+  /** 整页拖拽的三个处理函数 —— 2026-09-19 新增 */
+  const handleDragOverAll = (event) => {
+    event.preventDefault();
+    if (!dragActive) setDragActive(true);
+  };
+  const handleDragLeaveAll = (event) => {
+    // 拖到子元素上也会触发 leave，所以只在"真正离开 main"时才取消
+    if (event.currentTarget === event.target) setDragActive(false);
+  };
+  const handleDropAll = (event) => {
+    event.preventDefault();
+    setDragActive(false);
+    handleDrop(event);
+  };
+
   const handlerenderImageClick = (imageUrl, type) => {
     setBoxtype(type);
     setSelectedImage(imageUrl);
@@ -471,9 +529,9 @@ export default function Home() {
         return (
           <div className=" flex flex-col ">
             {uploadedImages.map((data, index) => (
-              <div key={index} className="m-2 rounded-2xl ring-offset-2 ring-2  ring-slate-100 flex flex-row ">
+              <div key={index} className="m-2 rounded-2xl ring-offset-2 ring-2 ring-slate-100 flex flex-col sm:flex-row ">
                 {renderFile(data, index)}
-                <div className="flex flex-col justify-center w-4/5">
+                <div className="flex flex-col justify-center w-full sm:w-4/5">
                   {[
                     { text: data.url, onClick: () => handleCopy(data.url) },
                     { text: `![${data.name}](${data.url})`, onClick: () => handleCopy(`![${data.name}](${data.url})`) },
@@ -572,7 +630,19 @@ export default function Home() {
 
 
   return (
-    <main className=" overflow-auto h-full flex w-full min-h-screen flex-col items-center justify-between">
+    <main
+      className=" overflow-auto h-full flex w-full min-h-screen flex-col items-center justify-between"
+      onDragOver={handleDragOverAll}
+      onDragLeave={handleDragLeaveAll}
+      onDrop={handleDropAll}
+    >
+      {dragActive && (
+        <div className="fixed inset-0 z-[60] bg-blue-500 bg-opacity-20 border-4 border-dashed border-blue-500 flex items-center justify-center pointer-events-none">
+          <div className="bg-white rounded-lg px-6 py-4 text-blue-600 text-lg shadow">
+            松手就上传
+          </div>
+        </div>
+      )}
       <header className="fixed top-0 h-[50px] left-0 w-full border-b bg-white flex z-50 justify-center items-center">
         <nav className="flex justify-between items-center w-full max-w-4xl px-4">图床</nav>
         {renderButton()}
@@ -584,7 +654,7 @@ export default function Home() {
             <div className="text-gray-800 text-lg">图片或视频上传
             </div>
             <div className="mb-4 text-sm text-gray-500">
-              上传文件最大 10 MB;本站已托管 <span className="text-cyan-600">{Total}</span> 张图片; 你访问本站的IP是：<span className="text-cyan-600">{IP}</span>
+              图片 ≤10MB（超出会自动压缩）、其它文件 ≤50MB · 本站已托管 <span className="text-cyan-600">{Total}</span> 张图片 · 你访问本站的IP是：<span className="text-cyan-600">{IP}</span>
             </div>
           </div>
           {/* 原来这里有一个「上传接口：TG_Channel ▾」下拉框。
@@ -601,8 +671,8 @@ export default function Home() {
           <div className="flex flex-wrap gap-3 min-h-[240px]">
             <LoadingOverlay loading={uploading} />
             {selectedFiles.map((file, index) => (
-              <div key={index} className="relative rounded-2xl w-44 h-48 ring-offset-2 ring-2  mx-3 my-3 flex flex-col items-center">
-                <div className="relative w-36 h-36 " onClick={() => handleImageClick(index)}>
+              <div key={index} className="relative rounded-2xl w-32 h-40 sm:w-44 sm:h-48 ring-offset-2 ring-2 mx-2 sm:mx-3 my-3 flex flex-col items-center">
+                <div className="relative w-24 h-24 sm:w-36 sm:h-36" onClick={() => handleImageClick(index)}>
                   {file.type.startsWith('image/') && (
                     <Image
                       src={URL.createObjectURL(file)}
@@ -660,6 +730,20 @@ export default function Home() {
 
           </div>
         </div>
+        {uploading && progress.total > 0 && (
+          <div className="w-full mt-3">
+            <div className="flex justify-between text-xs text-gray-500 mb-1">
+              <span>正在上传…</span>
+              <span>{progress.done} / {progress.total}</span>
+            </div>
+            <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500 transition-all"
+                style={{ width: `${Math.round((progress.done / progress.total) * 100)}%` }}
+              />
+            </div>
+          </div>
+        )}
         <div className="w-full rounded-md shadow-sm overflow-hidden mt-4 grid grid-cols-8">
           <div className="md:col-span-1 col-span-8">
             <label
@@ -712,29 +796,34 @@ export default function Home() {
             uploadedImages.length > 0 && (<>
               <div className="flex flex-wrap gap-3 mb-4 border-b border-gray-300 ">
                 <button
-                  onClick={() => setActiveTab('preview')}
+                  onClick={() => switchTab('preview')}
                   className={`px-4 py-2 ${activeTab === 'preview' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
                   Preview
                 </button>
                 <button
-                  onClick={() => setActiveTab('htmlLinks')}
+                  onClick={() => switchTab('htmlLinks')}
                   className={`px-4 py-2 ${activeTab === 'htmlLinks' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
                   HTML
                 </button>
                 <button
-                  onClick={() => setActiveTab('markdownLinks')}
+                  onClick={() => switchTab('markdownLinks')}
                   className={`px-4 py-2 ${activeTab === 'markdownLinks' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
                   Markdown
                 </button>
                 <button
-                  onClick={() => setActiveTab('bbcodeLinks')}
+                  onClick={() => switchTab('bbcodeLinks')}
                   className={`px-4 py-2 ${activeTab === 'bbcodeLinks' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
                   BBCode
                 </button>
                 <button
-                  onClick={() => setActiveTab('viewLinks')}
+                  onClick={() => switchTab('viewLinks')}
                   className={`px-4 py-2 ${activeTab === 'viewLinks' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
                   Links
+                </button>
+                <button
+                  onClick={handleCopyAll}
+                  className="px-4 py-2 bg-emerald-500 text-white rounded sm:ml-auto">
+                  一键复制全部直链
                 </button>
               </div>
               {renderTabContent()}
