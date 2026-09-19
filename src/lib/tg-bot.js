@@ -24,6 +24,7 @@ import {
   MAX_PHOTO_BYTES,
   MAX_OTHER_BYTES,
   escapeHtml,
+  humanSize,
   nowTimeString,
   shanghaiDate,
   extractFileIdFromPost,
@@ -31,6 +32,10 @@ import {
   dbUrlOf,
   parseFileRef,
   mimeToExt,
+  shortLink,
+  linkFormats,
+  buildKeyboard,
+  buildCaption,
   toCsv
 } from './tg-common.js';
 import { purgeFileCache } from './tg-serve.js';
@@ -225,7 +230,8 @@ function helpText(origin) {
   return [
     '📷 <b>图床管理助手</b>',
     '',
-    '上传请走网页端；这里是管理已上传图片的入口。',
+    '<b>上传</b>：直接把图片发给我就行（也可以把图片转发给我）。',
+    '想传原图就点「以文件发送」—— 不会被压缩。',
     '',
     '<b>可用命令</b>',
     '/stats — 总体统计',
@@ -871,6 +877,12 @@ export async function handleUpdate({ update, env, tg, db, origin, fetchImpl = fe
   const chatType = (msg.chat && msg.chat.type) || '';
 
   if (chatType === 'private') {
+    // 私聊里"发来的图" = 上传（2026-09-19 新增）。
+    // ⚠️ 这一支必须放在命令判断**之前**：带着图片的消息（哪怕还配了文字）
+    //    一律按"上传"处理 —— 这正是业主的要求（只有发图才算上传）。
+    if (hasIncomingMedia(msg)) {
+      return handleBotUpload({ msg, env, tg, db, origin });
+    }
     return handlePrivateMessage({ msg, env, tg, db, origin, fetchImpl, cachesImpl });
   }
 
@@ -956,6 +968,190 @@ function idText(msg, env) {
     '',
     '把「你的用户 ID」填到 TG_ADMIN_ID 即可获得管理权限。'
   ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// 「直接发图给 bot」= 上传（2026-09-19 新增，业主主动要求）
+// ---------------------------------------------------------------------------
+//
+// 为什么几乎不花成本：图片发给 bot 的时候，Telegram 已经把它存在自己的服务器上、
+// 并且给了我们一个 file_id。**我们不需要把文件下载下来再上传一遍** ——
+// 直接把同一个 file_id 交给 sendPhoto / sendDocument 送进存储频道就行。
+// 数据完全不经过我们的服务器，而且 **file_id 不变** ⇒ 频道里那条新消息的 file_id
+// 跟用户发来的是同一个 ⇒ `/i/<file_id>.jpg` 立刻就能用。
+//
+// 产出的结果刻意与「网页上传」保持一致（业主的要求）：
+//   · 频道里那条消息挂同一套按钮（打开图片 + 4 个复制按钮，见 buildKeyboard）
+//   · 数据库走同一个 saveImageInfo（它会和 webhook 补的占位行自动收敛成一行）
+//   · 回给用户同样的四种格式链接
+//
+// ⚠️ 安全：**只认 TG_ADMIN_ID 本人**。这是个人图床，bot 的用户名一旦被人知道，
+//    谁都能给它发图；不校验就等于给频道开了一个公开上传入口。
+//    校验沿用本项目一贯的 fail-closed：没配 TG_ADMIN_ID 就一律不收。
+
+/**
+ * 从一条消息里认出"可上传的文件"。
+ * 只支持两种：photo（Telegram 压过的图，≤10MB）和 document（"以文件发送"，≤50MB）。
+ * 其它媒体类型返回 null，由调用方给出提示。
+ */
+function pickIncomingFile(msg) {
+  if (!msg) return null;
+
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    // 同一张图 Telegram 会给好几档尺寸，取最大的那档（清晰度最好）
+    const largest = msg.photo.reduce((prev, cur) =>
+      ((prev.file_size || 0) > (cur.file_size || 0)) ? prev : cur);
+    return (largest && largest.file_id)
+      ? { kind: 'photo', fileId: largest.file_id, mime: 'image/jpeg', size: largest.file_size || 0, name: '' }
+      : null;
+  }
+
+  const d = msg.document;
+  if (d && d.file_id) {
+    return {
+      kind: 'document',
+      fileId: d.file_id,
+      mime: d.mime_type || '',
+      size: d.file_size || 0,
+      name: d.file_name || ''
+    };
+  }
+
+  return null;
+}
+
+/** 这条消息带媒体（但不一定是我们支持的那种）—— 用来决定要不要走上传那条路 */
+function hasIncomingMedia(msg) {
+  if (!msg) return false;
+  if (Array.isArray(msg.photo) && msg.photo.length) return true;
+  return !!(msg.document || msg.video || msg.animation || msg.audio ||
+    msg.voice || msg.video_note || msg.sticker);
+}
+
+async function handleBotUpload({ msg, env, tg, db, origin }) {
+  const chatId = msg.chat && msg.chat.id;
+  const fromId = String((msg.from && msg.from.id) || '');
+  const adminId = env.TG_ADMIN_ID ? String(env.TG_ADMIN_ID) : '';
+
+  // ---- 权限（fail-closed）----
+  if (!adminId) {
+    // 没配管理员时，为了让业主自己能发现，明确说一句（和命令那条提示同一个风格）
+    await reply(tg, chatId,
+      '⚠️ 还没配置 <code>TG_ADMIN_ID</code>，我不认得你，所以不能收图。\n\n'
+      + '先给我发一个 <code>/id</code> 查到你的用户 ID，把它填进 Cloudflare 的 '
+      + '<code>TG_ADMIN_ID</code>（类型选「机密」）并重新部署。');
+    return { handled: true, reason: 'no-admin-configured' };
+  }
+  if (fromId !== adminId) {
+    // 刻意不回 —— 不向陌生人暴露这个 bot 是干什么的
+    return { handled: false, reason: 'not-admin' };
+  }
+
+  // ---- 认文件 ----
+  const file = pickIncomingFile(msg);
+  if (!file) {
+    await reply(tg, chatId,
+      '📎 这个类型我暂时收不了。\n\n'
+      + '<b>能收的</b>：\n'
+      + '· 直接发<b>图片</b>（Telegram 会压一下，≤10MB）\n'
+      + '· 点 <b>「以文件发送」</b>发原图或其它文件（不压缩，≤50MB）');
+    return { handled: true, reason: 'unsupported-media' };
+  }
+
+  if (!env.TG_CHAT_ID) {
+    await reply(tg, chatId, '⚠️ 后台还没配 <code>TG_CHAT_ID</code>（存储频道），我没地方放这张图。');
+    return { handled: true, reason: 'no-channel' };
+  }
+
+  // ---- 体积（与网页上传同一套口径）----
+  const isPhoto = file.kind === 'photo';
+  const limit = isPhoto ? MAX_PHOTO_BYTES : MAX_OTHER_BYTES;
+  if (file.size && file.size > limit) {
+    await reply(tg, chatId,
+      '⚠️ 这个' + (isPhoto ? '图片' : '文件') + '大小 ' + humanSize(file.size)
+      + '，超过 Telegram 的 ' + (isPhoto ? '10MB（图片）' : '50MB') + ' 上限，我传不进频道。\n'
+      + (isPhoto ? '可以点「以文件发送」把原图当文件发过来试试。' : '压缩一下再发。'));
+    return { handled: true, reason: 'too-large' };
+  }
+
+  // ⭐ 关键：file_id 与用户发来的是**同一个**，所以链接现在就能算出来
+  const url = shortLink(origin, file.fileId, file.mime);
+  const method = isPhoto ? 'sendPhoto' : 'sendDocument';
+  const key = isPhoto ? 'photo' : 'document';
+
+  // ---- 送进频道（复用同一个 file_id：不下载、不上传）----
+  let sent = await tg.call(method, {
+    chat_id: String(env.TG_CHAT_ID),
+    [key]: file.fileId,
+    reply_markup: buildKeyboard(url)
+  });
+  let keyboardAttached = !!(sent && sent.ok);
+  if (!keyboardAttached) {
+    // 与网页上传一致的兜底：按钮挂不上，就把四种格式写进说明文字
+    sent = await tg.call(method, {
+      chat_id: String(env.TG_CHAT_ID),
+      [key]: file.fileId,
+      caption: buildCaption(url),
+      parse_mode: 'HTML'
+    });
+  }
+  if (!sent || !sent.ok) {
+    await reply(tg, chatId,
+      '❌ 没能传进频道：' + escapeHtml((sent && sent.description) || '未知原因')
+      + '\n<i>（如果提示和权限有关，请确认我在那个频道里是管理员。）</i>');
+    return { handled: true, reason: 'send-failed' };
+  }
+
+  const messageId = sent.result && sent.result.message_id;
+
+  // ---- 落库（复用共享函数；与 webhook 补的占位行自动收敛成一行）----
+  let dbError = null;
+  try {
+    await ensureSchema(db);
+    await saveImageInfo({
+      db,
+      url: dbUrlOf(file.fileId),      // 与网页上传同一个键：/cfile/<file_id>
+      referer: 'Telegram bot',
+      ip: 'unknown',
+      rating: -1,                     // -1 = 未检测；后台那个开关只认 === 3，所以显示为"关"
+      time: nowTimeString(),
+      total: 1,
+      mode: 'authoritative'
+    });
+    // 记下"这张图对应频道里的哪条消息"，/del 和「回复删图」都靠它定位
+    if (messageId) {
+      await db.prepare(
+        'INSERT OR REPLACE INTO tgmsg (file_id, chat_id, message_id, kind, ts) VALUES (?, ?, ?, ?, ?)'
+      ).bind(file.fileId, String(env.TG_CHAT_ID), messageId, file.kind, new Date().toISOString()).run();
+    }
+  } catch (e) {
+    dbError = (e && e.message) || String(e);
+    console.error('bot 直传：写库失败（图已进频道，仅记录失败）：', dbError);
+  }
+
+  // ---- 回给用户：与网页上传一样的四种格式 ----
+  const f = linkFormats(url);
+  const lines = [
+    '✅ <b>上传成功</b>，图已经在你的频道里了',
+    '',
+    '直链：<code>' + escapeHtml(f.direct) + '</code>',
+    'HTML：<code>' + escapeHtml(f.html) + '</code>',
+    'Markdown：<code>' + escapeHtml(f.markdown) + '</code>',
+    'BBCode：<code>' + escapeHtml(f.bbcode) + '</code>',
+    '',
+    '<i>点下面的按钮可以直接复制任意一种。</i>'
+  ];
+  if (dbError) lines.push('', '⚠️ 入库记录失败（图片本身没问题）：' + escapeHtml(dbError));
+  await reply(tg, chatId, lines.join('\n'), { reply_markup: buildKeyboard(url) });
+
+  return {
+    handled: true,
+    reason: 'uploaded',
+    fileId: file.fileId,
+    url,
+    messageId,
+    keyboardAttached
+  };
 }
 
 async function handlePrivateMessage({ msg, env, tg, db, origin, fetchImpl, cachesImpl }) {
