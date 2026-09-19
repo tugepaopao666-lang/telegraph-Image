@@ -25,6 +25,7 @@ import {
   MAX_OTHER_BYTES,
   escapeHtml,
   humanSize,
+  CAPTION_LIMIT,
   nowTimeString,
   shanghaiDate,
   extractFileIdFromPost,
@@ -204,6 +205,51 @@ async function reply(tg, chatId, text, extra) {
   }
 }
 
+/** 等一会儿（用于"相册合并成一条回复"：等同一组照片都到齐） */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 算出"上海时区的今天 00:00"对应的 ISO(UTC) 字符串。
+ *
+ * 为什么要转成 ISO：`imginfo.time` 里存的是「2026年9月18日 11:30:00」这种中文本地化串，
+ * SQL 里没法可靠地比大小（这是本项目的一条老约定）；而我们自己新增的 `tgmsg.ts`
+ * 存的是 ISO UTC 串（`new Date().toISOString()`），**字典序 = 时间序**，
+ * 可以直接用 `>=` 去比。
+ */
+function startOfShanghaiDayISO(now) {
+  const day = shanghaiDate(now);   // 'YYYY-MM-DD'（上海时区）
+  return new Date(Date.parse(day + 'T00:00:00+08:00')).toISOString();
+}
+
+/**
+ * 由 tgmsg.kind 猜一个"展示用"的扩展名。
+ * photo 一定是 Telegram 压过的 jpeg ⇒ '.jpg'（带扩展名的链接对 Markdown 编辑器更友好）；
+ * document 不知道具体格式，就**不带**扩展名（不带也照样能打开，tg-serve 会兜底）。
+ */
+function extForKind(kind) {
+  return kind === 'photo' ? '.jpg' : '';
+}
+
+/** ISO 时间串 → 「09-19 21:30」（上海时区）。拿不准就原样返回，绝不抛。 */
+function shortTime(iso) {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso == null ? '' : iso);
+    return new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    }).format(d);
+  } catch (e) {
+    return String(iso == null ? '' : iso);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 命令（⚠️ 不再注册成 Telegram 菜单）
 // ---------------------------------------------------------------------------
@@ -219,7 +265,8 @@ export const BOT_COMMANDS = [
   { command: 'start', description: '使用说明' },
   { command: 'help', description: '使用说明' },
   { command: 'stats', description: '统计（可带图片链接看单张）' },
-  { command: 'del', description: '下架某张图片' },
+  { command: 'list', description: '看最近上传的图片（分页）' },
+  { command: 'del', description: '下架图片（可一次删多张）' },
   { command: 'export', description: '导出全部链接清单（CSV）' },
   { command: 'sync', description: '把最近的频道消息补进数据库' },
   { command: 'health', description: '立刻做一次体检' },
@@ -234,9 +281,10 @@ function helpText(origin) {
     '想传原图就点「以文件发送」—— 不会被压缩。',
     '',
     '<b>可用命令</b>',
-    '/stats — 总体统计',
+    '/stats — 总体统计（含今天 / 最近 7 天）',
     '/stats &lt;链接&gt; — 看单张图片的访问量',
-    '/del &lt;链接&gt; — 下架某张图（同时清数据库和缓存）',
+    '/list — 看最近上传的图片（可加页码，如 /list 2）',
+    '/del &lt;链接&gt; — 下架图片（<b>多个链接用空格隔开可一次删多张</b>）',
     '/export — 导出全部链接清单（CSV 文件）',
     '/sync — 把最近的频道消息补进数据库',
     '/health — 立刻做一次体检',
@@ -422,7 +470,7 @@ export async function deleteImage({ fileId, env, tg, db, origin, cachesImpl = nu
 // 统计
 // ---------------------------------------------------------------------------
 
-export async function statsOverview({ db, origin }) {
+export async function statsOverview({ db, origin, now = new Date() }) {
   const totalRow = await db.prepare(
     'SELECT COUNT(*) AS images, COALESCE(SUM(total), 0) AS views FROM imginfo'
   ).first();
@@ -434,10 +482,34 @@ export async function statsOverview({ db, origin }) {
   ).all()).results || [];
   const logRow = await db.prepare('SELECT COUNT(*) AS c FROM tgimglog').first();
 
+  // ---- 时间维度（2026-09-19 新增）----
+  // 为什么能按时间算：用我们自己新增的 tgmsg.ts（ISO UTC 串，字典序=时间序）。
+  // imginfo.time 是「2026年9月18日 11:30:00」这种中文本地化串，SQL 里没法比大小。
+  const todayISO = startOfShanghaiDayISO(now);
+  const weekISO = new Date(Date.parse(todayISO) - 6 * 86400000).toISOString(); // 含今天在内的 7 天
+  let todayNew = 0;
+  let weekNew = 0;
+  let latest = [];
+  try {
+    const r1 = await db.prepare('SELECT COUNT(*) AS c FROM tgmsg WHERE ts >= ?').bind(todayISO).first();
+    todayNew = (r1 && r1.c) || 0;
+    const r2 = await db.prepare('SELECT COUNT(*) AS c FROM tgmsg WHERE ts >= ?').bind(weekISO).first();
+    weekNew = (r2 && r2.c) || 0;
+    latest = (await db.prepare(
+      'SELECT file_id, ts, kind FROM tgmsg ORDER BY ts DESC LIMIT 5'
+    ).all()).results || [];
+  } catch (e) {
+    // 老库没有 tgmsg（理论上 ensureSchema 会建）→ 忽略，不影响其它统计
+    console.error('statsOverview 时间维度查询失败：', e && e.message);
+  }
+
   return {
     images: (totalRow && totalRow.images) || 0,
     views: (totalRow && totalRow.views) || 0,
     logRows: (logRow && logRow.c) || 0,
+    todayNew,
+    weekNew,
+    latest,
     top,
     refs,
     origin
@@ -1079,19 +1151,25 @@ async function handleBotUpload({ msg, env, tg, db, origin }) {
   const method = isPhoto ? 'sendPhoto' : 'sendDocument';
   const key = isPhoto ? 'photo' : 'document';
 
+  // 你发图时配的文字 → 作为频道里那条消息的说明（2026-09-19 新增，以前是忽略的）。
+  // 用 escapeHtml 过一遍：那条消息带 parse_mode=HTML，不过滤的话你写个 "<" 就会把格式搞坏。
+  const userCaption = String(msg.caption || '').trim();
+  const safeCaption = userCaption ? escapeHtml(userCaption) : '';
+
   // ---- 送进频道（复用同一个 file_id：不下载、不上传）----
-  let sent = await tg.call(method, {
+  let sent = await tg.call(method, Object.assign({
     chat_id: String(env.TG_CHAT_ID),
     [key]: file.fileId,
     reply_markup: buildKeyboard(url)
-  });
+  }, safeCaption ? { caption: safeCaption, parse_mode: 'HTML' } : {}));
   let keyboardAttached = !!(sent && sent.ok);
   if (!keyboardAttached) {
     // 与网页上传一致的兜底：按钮挂不上，就把四种格式写进说明文字
+    // （你原来写的文字放在前面，别丢了；总长按 Telegram 的 1024 上限截断）
     sent = await tg.call(method, {
       chat_id: String(env.TG_CHAT_ID),
       [key]: file.fileId,
-      caption: buildCaption(url),
+      caption: [safeCaption, buildCaption(url)].filter(Boolean).join('\n\n').slice(0, CAPTION_LIMIT),
       parse_mode: 'HTML'
     });
   }
@@ -1129,7 +1207,44 @@ async function handleBotUpload({ msg, env, tg, db, origin }) {
     console.error('bot 直传：写库失败（图已进频道，仅记录失败）：', dbError);
   }
 
-  // ---- 回给用户：与网页上传一样的四种格式 ----
+  const out = {
+    handled: true,
+    reason: 'uploaded',
+    fileId: file.fileId,
+    url,
+    messageId,
+    keyboardAttached
+  };
+
+  // ---- 回执 ----
+  // 相册（一次发多张）会被 Telegram 拆成多条消息，但它们的 media_group_id 相同。
+  // 这里把结果攒起来，由"抢到记账权"的那一条**只回一条汇总** —— 免得发 5 张回 5 条。
+  const gid = msg.media_group_id ? String(msg.media_group_id) : '';
+  if (!gid || !db) {
+    await sendUploadReceipt({ tg, chatId, url, dbError });
+    return out;
+  }
+
+  const claim = await collectMediaGroupItem({ db, gid, msg, fileId: file.fileId, url, dbError });
+  if (!claim.isOwner) {
+    // 图已经进频道了；汇总回复交给负责的那一条去发
+    return Object.assign(out, { mediaGroup: gid, reporter: false });
+  }
+
+  const settleMs = Number(env.MEDIA_GROUP_WAIT_MS != null ? env.MEDIA_GROUP_WAIT_MS : 1500);
+  if (settleMs > 0) await sleep(settleMs);
+  const items = await readMediaGroupItems({ db, gid });
+  await clearMediaGroup({ db, gid });
+  await sendGroupReceipt({ tg, chatId, items });
+  return Object.assign(out, { mediaGroup: gid, reporter: true, groupCount: items.length });
+}
+
+// ---------------------------------------------------------------------------
+// 回执（单张 / 相册汇总）
+// ---------------------------------------------------------------------------
+
+/** 单张上传成功的回执：四种格式 + 同一套按钮（与网页上传一致） */
+async function sendUploadReceipt({ tg, chatId, url, dbError }) {
   const f = linkFormats(url);
   const lines = [
     '✅ <b>上传成功</b>，图已经在你的频道里了',
@@ -1142,16 +1257,78 @@ async function handleBotUpload({ msg, env, tg, db, origin }) {
     '<i>点下面的按钮可以直接复制任意一种。</i>'
   ];
   if (dbError) lines.push('', '⚠️ 入库记录失败（图片本身没问题）：' + escapeHtml(dbError));
-  await reply(tg, chatId, lines.join('\n'), { reply_markup: buildKeyboard(url) });
+  return reply(tg, chatId, lines.join('\n'), { reply_markup: buildKeyboard(url) });
+}
 
-  return {
-    handled: true,
-    reason: 'uploaded',
-    fileId: file.fileId,
-    url,
-    messageId,
-    keyboardAttached
-  };
+/** 相册的回执：一条消息列出所有链接 */
+async function sendGroupReceipt({ tg, chatId, items }) {
+  const okItems = (items || []).filter((it) => it && it.url);
+  if (okItems.length === 0) return null;
+  if (okItems.length === 1) {
+    // 只攒到一条（例如其它几条还在路上）→ 退回单张那条格式，别让用户看到"一共 1 张"
+    return sendUploadReceipt({ tg, chatId, url: okItems[0].url });
+  }
+  const lines = ['✅ <b>上传成功</b>（一共 ' + okItems.length + ' 张），图都已经在频道里了', ''];
+  okItems.forEach((it, i) => {
+    lines.push('<b>' + (i + 1) + '.</b> <code>' + escapeHtml(it.url) + '</code>');
+  });
+  lines.push('', '<i>想看某一张的四种格式（HTML / Markdown / BBCode），把它单独再发一次就行。</i>');
+  return reply(tg, chatId, lines.join('\n'));
+}
+
+// ---------------------------------------------------------------------------
+// 相册记账（botstate 复用为临时表）
+// ---------------------------------------------------------------------------
+// 每条各写自己的 key（互不覆盖）；谁能"抢到记账权"由 botstate 的主键约束**原子**决定；
+// 负责人等一小会儿把所有条目读出来、回一条汇总，然后把临时记录清掉。
+// 之所以不用一张新表：ensureSchema() 已经会建 botstate(key,value)，够用了。
+const MG_PREFIX = 'mg:';
+const MG_OWNER_PREFIX = 'mgown:';
+
+async function collectMediaGroupItem({ db, gid, msg, fileId, url, dbError }) {
+  const item = { fileId, url, messageId: msg.message_id, error: dbError || null };
+  // message_id 补零对齐，这样 ORDER BY key 就是消息先后顺序
+  const itemKey = MG_PREFIX + gid + ':' + String(msg.message_id).padStart(12, '0');
+  try {
+    await db.prepare('INSERT OR REPLACE INTO botstate (key, value) VALUES (?, ?)')
+      .bind(itemKey, JSON.stringify(item)).run();
+  } catch (e) {
+    console.error('相册记账失败（不影响上传）：', e && e.message);
+  }
+
+  let isOwner = false;
+  try {
+    // 原子抢占：key 是主键 ⇒ 只有第一个写入者能成功
+    const r = await db.prepare(
+      'INSERT INTO botstate (key, value) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM botstate WHERE key = ?)'
+    ).bind(MG_OWNER_PREFIX + gid, '1', MG_OWNER_PREFIX + gid).run();
+    isOwner = ((r && r.meta && r.meta.changes) || 0) > 0;
+  } catch (e) {
+    console.error('相册抢记账权失败（当作普通成员）：', e && e.message);
+  }
+  return { isOwner };
+}
+
+async function readMediaGroupItems({ db, gid }) {
+  try {
+    const rows = (await db.prepare(
+      'SELECT value FROM botstate WHERE key LIKE ? ORDER BY key ASC'
+    ).bind(MG_PREFIX + gid + ':%').all()).results || [];
+    return rows
+      .map((r) => { try { return JSON.parse(r.value); } catch (e) { return null; } })
+      .filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+
+async function clearMediaGroup({ db, gid }) {
+  try {
+    await db.prepare('DELETE FROM botstate WHERE key LIKE ?').bind(MG_PREFIX + gid + ':%').run();
+    await db.prepare('DELETE FROM botstate WHERE key = ?').bind(MG_OWNER_PREFIX + gid).run();
+  } catch (e) {
+    // 清不掉就留几条无用记录，无害
+  }
 }
 
 async function handlePrivateMessage({ msg, env, tg, db, origin, fetchImpl, cachesImpl }) {
@@ -1238,12 +1415,19 @@ async function handlePrivateMessage({ msg, env, tg, db, origin, fetchImpl, cache
         return `　• ${Number(r.total) || 0} 次　${escapeHtml(origin)}/i/${escapeHtml(ref.fileId)}`;
       }).join('\n');
       const refLines = o.refs.map(r => `　• ${Number(r.c) || 0} 次　${escapeHtml(r.referer || '(空)')}`).join('\n');
+      const latestLines = (o.latest || []).map(r =>
+        `　• ${escapeHtml(shortTime(r.ts))}　${escapeHtml(origin)}/i/${escapeHtml(r.file_id)}${extForKind(r.kind)}`
+      ).join('\n');
       await reply(tg, msg.chat.id, [
         '📊 <b>总体统计</b>',
         '',
         `图片总数：<b>${Number(o.images) || 0}</b>`,
         `累计访问：<b>${Number(o.views) || 0}</b>`,
         `访问日志：<b>${Number(o.logRows) || 0}</b> 条`,
+        '',
+        `今日新增：<b>${Number(o.todayNew) || 0}</b> 张`,
+        `最近 7 天：<b>${Number(o.weekNew) || 0}</b> 张`,
+        latestLines ? '\n🆕 <b>最近上传</b>\n' + latestLines : '',
         topLines ? '\n🔥 <b>访问最多</b>\n' + topLines : '',
         refLines ? '\n🔗 <b>主要来源</b>\n' + refLines : ''
       ].join('\n'));
@@ -1251,26 +1435,104 @@ async function handlePrivateMessage({ msg, env, tg, db, origin, fetchImpl, cache
     }
     case 'del': {
       if (!arg) {
-        await reply(tg, msg.chat.id, '用法：<code>/del https://你的域名/i/xxxx.jpg</code>\n也可以只发 file_id。');
+        await reply(tg, msg.chat.id,
+          '用法：<code>/del https://你的域名/i/xxxx.jpg</code>\n'
+          + '也可以只发 file_id。<b>多个链接用空格隔开，就能一次删多张。</b>');
         return { handled: true, cmd, reason: 'no-arg' };
       }
-      const { fileId } = parseFileRef(arg);
-      if (!fileId) {
+
+      // 支持一次删多条（2026-09-19 新增）：按空白切开，每段各自解析
+      const parts = arg.split(/\s+/).filter(Boolean);
+      const refs = parts.map((p) => parseFileRef(p));
+      const good = refs.filter((x) => x.fileId);
+      const bad = refs.length - good.length;
+
+      if (!good.length) {
         await reply(tg, msg.chat.id, '没看懂这个链接，试试直接发图片链接。');
         return { handled: true, cmd, reason: 'bad-ref' };
       }
-      const r = await deleteImage({ fileId, env, tg, db, origin, cachesImpl });
+
+      // 只有一条：保持原来那份详细回执（老用户看惯了）
+      if (good.length === 1 && !bad) {
+        const fileId = good[0].fileId;
+        const r = await deleteImage({ fileId, env, tg, db, origin, cachesImpl });
+        const lines = [
+          '🗑 <b>下架结果</b>',
+          '',
+          `file_id：<code>${escapeHtml(fileId)}</code>`,
+          `${r.messageDeleted ? '✅' : '⚠️'} 频道消息：${r.messageDeleted ? '已删除' : '未删除'}`,
+          `✅ 数据库清理：${r.dbRowsRemoved} 行`,
+          `✅ 缓存清理：${r.cachePurged} 条`
+        ];
+        if (r.notes.length) lines.push('', '注意：', ...r.notes.map(n => '　• ' + escapeHtml(n)));
+        await reply(tg, msg.chat.id, lines.join('\n'));
+        return { handled: true, cmd, result: r };
+      }
+
+      // 多条：逐条删，最后给一条汇总（单条失败不影响后面的）
+      const results = [];
+      for (const it of good) {
+        try {
+          results.push({
+            fileId: it.fileId,
+            r: await deleteImage({ fileId: it.fileId, env, tg, db, origin, cachesImpl })
+          });
+        } catch (e) {
+          results.push({ fileId: it.fileId, error: (e && e.message) || '异常' });
+        }
+      }
+      const sum = (fn) => results.reduce((a, x) => a + ((x.r && fn(x.r)) || 0), 0);
+      const deleted = results.filter((x) => x.r && x.r.messageDeleted).length;
       const lines = [
-        '🗑 <b>下架结果</b>',
+        `🗑 <b>批量下架完成</b>（共 ${good.length} 张）`,
         '',
-        `file_id：<code>${escapeHtml(fileId)}</code>`,
-        `${r.messageDeleted ? '✅' : '⚠️'} 频道消息：${r.messageDeleted ? '已删除' : '未删除'}`,
-        `✅ 数据库清理：${r.dbRowsRemoved} 行`,
-        `✅ 缓存清理：${r.cachePurged} 条`
+        `✅ 频道消息已删：<b>${deleted}</b> 张`,
+        `✅ 数据库已清：<b>${sum((r) => r.dbRowsRemoved)}</b> 行`,
+        `✅ 缓存已清：<b>${sum((r) => r.cachePurged)}</b> 条`,
+        ''
       ];
-      if (r.notes.length) lines.push('', '注意：', ...r.notes.map(n => '　• ' + escapeHtml(n)));
+      results.forEach((x) => {
+        const flag = x.error ? '❌' : (x.r && x.r.messageDeleted ? '✅' : '⚠️');
+        lines.push(flag + ' <code>' + escapeHtml(x.fileId) + '</code>'
+          + (x.error ? '　' + escapeHtml(x.error) : ''));
+      });
+      if (bad) lines.push('', `⚠️ 有 ${bad} 段看不懂，已跳过。`);
       await reply(tg, msg.chat.id, lines.join('\n'));
-      return { handled: true, cmd, result: r };
+      return { handled: true, cmd, batch: good.length, results };
+    }
+    case 'list': {
+      // 分页看最近上传（2026-09-19 新增）。用 tgmsg（有 ISO 时间）而不是 imginfo。
+      const per = 10;
+      const totalRow = await db.prepare('SELECT COUNT(*) AS c FROM tgmsg').first();
+      const total = (totalRow && totalRow.c) || 0;
+      if (!total) {
+        await reply(tg, msg.chat.id,
+          '还没有上传记录。\n'
+          + '<i>（这个列表统计的是「频道消息已登记」的图；很早期上传的老图可能不在里面，'
+          + '那种情况用 /export 拿完整清单。）</i>');
+        return { handled: true, cmd, reason: 'empty' };
+      }
+      const maxPage = Math.max(1, Math.ceil(total / per));
+      const page = Math.min(Math.max(1, parseInt(arg, 10) || 1), maxPage);
+      const rows = (await db.prepare(
+        'SELECT file_id, ts, kind FROM tgmsg ORDER BY ts DESC LIMIT ? OFFSET ?'
+      ).bind(per, (page - 1) * per).all()).results || [];
+
+      const lines = [`📄 <b>最近上传</b>　第 ${page} / ${maxPage} 页　共 ${total} 张`, ''];
+      rows.forEach((r, i) => {
+        const no = (page - 1) * per + i + 1;
+        lines.push(`<b>${no}.</b> ${escapeHtml(shortTime(r.ts))}　<code>${escapeHtml(origin)}/i/${escapeHtml(r.file_id)}${extForKind(r.kind)}</code>`);
+      });
+      const nav = [];
+      if (page > 1) nav.push('/list ' + (page - 1));
+      if (page < maxPage) nav.push('/list ' + (page + 1));
+      lines.push('');
+      lines.push(nav.length
+        ? '<i>翻页：' + nav.map((c) => '<code>' + c + '</code>').join('　') + '</i>'
+        : '<i>已经是最后一页了。</i>');
+      lines.push('<i>按上传时间倒序；要完整清单用 /export。</i>');
+      await reply(tg, msg.chat.id, lines.join('\n'));
+      return { handled: true, cmd, page, maxPage, total };
     }
     case 'export': {
       await reply(tg, msg.chat.id, '⏳ 正在生成清单…');
